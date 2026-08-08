@@ -39,6 +39,24 @@ impl<'a> PythonGenerator<'a> {
         output
     }
 
+    /// Black's default line length. Assignments longer than this get their
+    /// right-hand side wrapped in parentheses on its own line.
+    const LINE_LENGTH: usize = 88;
+
+    /// Emits a class-level constant assignment already in the form Black would
+    /// produce, so the generated file needs no formatting pass afterwards.
+    fn assignment_lines(name: &str, value: &str) -> Vec<String> {
+        let single = format!("    {} = \"{}\"", name, value);
+        if single.chars().count() <= Self::LINE_LENGTH {
+            return vec![single];
+        }
+        vec![
+            format!("    {} = (", name),
+            format!("        \"{}\"", value),
+            "    )".to_string(),
+        ]
+    }
+
     fn generate_classes(&self) -> String {
         let mut lines = Vec::new();
 
@@ -54,22 +72,29 @@ impl<'a> PythonGenerator<'a> {
             lines.push(format!("class {}:", module_name));
 
             // Use doc comment from module if available
+            let mut has_docstring = false;
             if !module.doc_comment.is_empty() {
                 let first_line = module.doc_comment.lines().next().unwrap_or("").trim();
                 if !first_line.is_empty() {
                     lines.push(format!("    \"\"\"{}\"\"\"", first_line));
+                    has_docstring = true;
                 }
             }
 
             if !module.constants.is_empty() {
-                lines.push("".to_string());
+                // Black keeps a blank line after a class docstring but strips one
+                // at the top of a class body, so only emit it when a docstring
+                // precedes the constants.
+                if has_docstring {
+                    lines.push("".to_string());
+                }
                 for constant in &module.constants {
                     if !constant.doc_comment.is_empty() {
                         for comment_line in constant.doc_comment.lines() {
                             lines.push(format!("    # {}", comment_line));
                         }
                     }
-                    lines.push(format!("    {} = \"{}\"", constant.name, constant.value));
+                    lines.extend(Self::assignment_lines(&constant.name, &constant.value));
                 }
             }
 
@@ -227,4 +252,79 @@ EXAMPLES:
     cargo run -p dynamo-codegen --bin gen-python-prometheus-names -- --output /tmp/test.py
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The committed Python module is a build artifact of this generator. If it
+    /// drifts, importers such as components/src/dynamo/common/utils/prometheus.py
+    /// fail with AttributeError at worker startup rather than here. Regenerate with:
+    ///     cargo run -p dynamo-codegen --bin gen-python-prometheus-names
+    #[test]
+    fn committed_python_matches_generated() {
+        let codegen_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let rust_source = codegen_dir.join("../../../runtime/src/metrics/prometheus_names.rs");
+        let python_module = codegen_dir.join("../src/dynamo/prometheus_names.py");
+
+        let rust_src = std::fs::read_to_string(&rust_source)
+            .unwrap_or_else(|e| panic!("read {}: {e}", rust_source.display()));
+        let parser = PrometheusParser::parse_file(&rust_src).expect("parse Rust source");
+        let generated = PythonGenerator::new(&parser).generate_python_file();
+
+        let committed = std::fs::read_to_string(&python_module)
+            .unwrap_or_else(|e| panic!("read {}: {e}", python_module.display()));
+
+        if generated == committed {
+            return;
+        }
+
+        // assert_eq! on two ~500-line strings prints both in full, which buries
+        // the one line that actually drifted. Report the first divergence instead.
+        let (mut gen_lines, mut got_lines) = (generated.lines(), committed.lines());
+        let mut lineno = 0;
+        loop {
+            lineno += 1;
+            match (gen_lines.next(), got_lines.next()) {
+                (None, None) => break,
+                (expected, actual) if expected == actual => continue,
+                (expected, actual) => panic!(
+                    "prometheus_names.py is out of sync with prometheus_names.rs at line {lineno}.\n  \
+                     expected (from generator): {:?}\n  \
+                     found    (committed file): {:?}\n\
+                     Regenerate: cargo run -p dynamo-codegen --bin gen-python-prometheus-names",
+                    expected.unwrap_or("<end of file>"),
+                    actual.unwrap_or("<end of file>"),
+                ),
+            }
+        }
+    }
+
+    /// Guards the two formatting rules the generator has to reproduce so that the
+    /// committed file needs no Black pass: no blank line at the top of a class
+    /// body without a docstring, and Black-style wrapping past the line limit.
+    #[test]
+    fn output_is_black_formatted() {
+        let short = PythonGenerator::assignment_lines("SHORT", "short_value");
+        assert_eq!(short, vec![r#"    SHORT = "short_value""#]);
+
+        let long_name = "MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL";
+        let long = PythonGenerator::assignment_lines(
+            long_name,
+            "model_migration_max_seq_len_exceeded_total",
+        );
+        assert_eq!(
+            long,
+            vec![
+                format!("    {long_name} = ("),
+                r#"        "model_migration_max_seq_len_exceeded_total""#.to_string(),
+                "    )".to_string(),
+            ]
+        );
+
+        for line in PythonGenerator::assignment_lines("SHORT", "short_value") {
+            assert!(line.chars().count() <= PythonGenerator::LINE_LENGTH);
+        }
+    }
 }
