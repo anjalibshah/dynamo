@@ -12,7 +12,7 @@ use super::config::RouterQueuePolicy;
 use super::policy_config::{PolicyClassConfig, PolicyProfile};
 use super::queue_admission::{
     QueueAdmissionDecision, QueueAdmissionEvent, QueueAdmissionId, QueueAdmissionPolicy,
-    QueueAdmissionRequest, QueueAdmissionWorkerSnapshot, WorkerPlacement,
+    QueueAdmissionRequest, QueueAdmissionWorkerSnapshot, RequestProgress, WorkerPlacement,
 };
 use super::types::SessionContext;
 use crate::protocols::{WorkerId, WorkerWithDpRank};
@@ -479,6 +479,7 @@ impl<T> PolicyQueue<T> {
         &mut self,
         request_id: &str,
         context_tokens: usize,
+        progress: RequestProgress,
         session_context: Option<&SessionContext>,
         worker_snapshot: &QueueAdmissionWorkerSnapshot,
         pinned_worker: Option<WorkerWithDpRank>,
@@ -493,6 +494,7 @@ impl<T> PolicyQueue<T> {
             id,
             request_id,
             context_tokens,
+            progress,
             session_context,
             worker_snapshot,
             pinned_worker,
@@ -1038,6 +1040,7 @@ policy_classes:
             .admit_with_admission_policy(
                 "request-1",
                 32,
+                RequestProgress::new(32).0,
                 None,
                 &snapshot,
                 None,
