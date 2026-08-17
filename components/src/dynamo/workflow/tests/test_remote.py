@@ -530,6 +530,7 @@ async def test_tensor_server_imports_input_and_exports_per_consumer() -> None:
     class Carrier:
         def __init__(self):
             self.exports = []
+            self.released = []
 
         async def import_tensor(self, reference):
             assert reference == {"remote": "reference"}
@@ -555,6 +556,9 @@ async def test_tensor_server_imports_input_and_exports_per_consumer() -> None:
                 for transfer_id in transfer_ids
             }
 
+        def release_imported_tensor(self, tensor):
+            self.released.append(tensor)
+
     carrier = Carrier()
     request = StageRequestEnvelope(
         workflow_name="remote-wire",
@@ -578,6 +582,58 @@ async def test_tensor_server_imports_input_and_exports_per_consumer() -> None:
 
     assert set(fanout.transfers) == {"classifier.tensor", "generator.tensor"}
     assert carrier.exports == ["classifier.tensor", "generator.tensor"]
+    assert len(carrier.released) == 1
+    assert torch.equal(carrier.released[0], torch.ones((2, 4)))
+
+
+async def test_tensor_server_releases_borrowed_input_after_runner_failure() -> None:
+    tensor_spec = ValueSpec(type="tensor", dtype="float32", shape=(2, 4))
+
+    class FailingRunner:
+        contract = StageContract(
+            id="tensor",
+            inputs={"tensor": tensor_spec},
+            outputs={"result": ValueSpec(type="json")},
+        )
+
+        async def run(self, inputs, context):
+            raise RuntimeError("classifier failed")
+
+    class Carrier:
+        def __init__(self):
+            self.tensor = torch.ones((2, 4), dtype=torch.float32)
+            self.released = []
+
+        async def import_tensor(self, reference):
+            return self.tensor
+
+        async def export_tensor(self, tensor, transfer_id):
+            raise AssertionError("no tensor output is declared")
+
+        async def export_tensor_fanout(self, tensor, transfer_ids):
+            raise AssertionError("no tensor output is declared")
+
+        def release_imported_tensor(self, tensor):
+            self.released.append(tensor)
+
+    carrier = Carrier()
+    request = StageRequestEnvelope(
+        workflow_name="remote-wire",
+        stage_id="tensor",
+        contract_id="tensor",
+        attempt_id="request-1",
+        invocation_id="request-1:tensor",
+        timeout_seconds=None,
+        inputs={"tensor": {"remote": "reference"}},
+        output_transfers={},
+    )
+
+    with pytest.raises(RuntimeError, match="classifier failed"):
+        await RemoteStageServer("tensor", FailingRunner(), carrier).generate(
+            request.to_dict()
+        ).__anext__()
+
+    assert carrier.released == [carrier.tensor]
 
 
 async def test_tensor_import_is_bounded_by_remote_stage_deadline() -> None:

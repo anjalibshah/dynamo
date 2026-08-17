@@ -92,6 +92,14 @@ class TensorCarrier(Protocol):
 
 
 @runtime_checkable
+class ReleasableTensorCarrier(Protocol):
+    """Optional consumer hook for borrowed tensor storage."""
+
+    def release_imported_tensor(self, tensor: Any) -> None:
+        ...
+
+
+@runtime_checkable
 class _TensorValue(Protocol):
     shape: Any
     dtype: Any
