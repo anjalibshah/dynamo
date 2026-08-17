@@ -18,18 +18,38 @@
 package provideroverride
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"strings"
 
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
-	jsonpatch "github.com/evanphx/json-patch/v5"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	sigsjson "sigs.k8s.io/json"
 )
+
+// GroveFieldOwner is the server-side apply manager for Grove provider programs.
+const GroveFieldOwner = "dynamo-operator-grove-provider-override"
+
+// DryRunGroveProgram asks the API server to validate a complete rendered Grove
+// provider program without persisting it. kubeClient and desired must not be nil.
+func DryRunGroveProgram(
+	ctx context.Context,
+	kubeClient client.Client,
+	desired *unstructured.Unstructured,
+) error {
+	// Exercise the installed CRD and admission chain; controller-runtime Apply is strictly field-validated.
+	return kubeClient.Apply(
+		ctx,
+		client.ApplyConfigurationFromUnstructured(desired.DeepCopy()),
+		client.FieldOwner(GroveFieldOwner),
+		client.ForceOwnership,
+		client.DryRunAll,
+	)
+}
 
 // HasGroveOverrides reports whether a DGD contains a provider-native fragment
 // at any Grove provider context. dgd must not be nil.
@@ -59,10 +79,10 @@ func HasGroveOverrides(dgd *nvidiacomv1beta1.DynamoGraphDeployment) bool {
 }
 
 // ApplyGroveOverrides converts a fully rendered PodCliqueSet to unstructured
-// form and overlays each sparse provider-native fragment at its resolved
-// destination. Keeping the result unstructured preserves provider fields that
-// are newer than the Grove Go types compiled into Dynamo. dgd and desired must
-// not be nil.
+// form and inserts each provider-owned subtree at its resolved destination.
+// Keeping the result unstructured preserves provider fields that are newer
+// than the Grove Go types compiled into Dynamo. dgd and desired must not be
+// nil.
 func ApplyGroveOverrides(
 	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
 	desired *grovev1alpha1.PodCliqueSet,
@@ -127,18 +147,23 @@ func applyGroveRootOverride(result *unstructured.Unstructured, override *nvidiac
 		return nil
 	}
 
-	// Verify the persisted identity before merging the root object fragment.
+	// Verify the persisted identity before inserting the root-owned subtree.
 	if err := validateOverrideIdentity(override, ScopeRoot, nil); err != nil {
 		return err
 	}
 
-	// Overlay the sparse root fragment with JSON Merge Patch semantics.
-	patched, err := mergeJSONObjects(result.Object, override.Value.Raw)
+	// Replace the registered opaque subtree without defining merge or null semantics.
+	topologyConstraint, err := groveTopologyConstraint(override)
 	if err != nil {
-		return fmt.Errorf("merge value: %w", err)
+		return err
 	}
-	result.Object = patched
-	return nil
+	return unstructured.SetNestedField(
+		result.Object,
+		topologyConstraint,
+		"spec",
+		"template",
+		"topologyConstraint",
+	)
 }
 
 // applyGroveComponentOverride applies an optional component fragment. result
@@ -162,18 +187,18 @@ func applyGroveComponentOverride(
 	name := strings.ToLower(component.ComponentName)
 	switch override.Target {
 	case TargetPodCliqueTemplateSpec:
-		return patchNamedGroveTemplate(
+		return setNamedGroveTopologyConstraint(
 			result,
 			[]string{"spec", "template", "cliques"},
 			name,
-			override.Value.Raw,
+			override,
 		)
 	case TargetPodCliqueScalingGroupConfig:
-		return patchNamedGroveTemplate(
+		return setNamedGroveTopologyConstraint(
 			result,
 			[]string{"spec", "template", "podCliqueScalingGroups"},
 			name,
-			override.Value.Raw,
+			override,
 		)
 	default:
 		return fmt.Errorf("unsupported target %q", override.Target)
@@ -202,12 +227,12 @@ func applyGroveRoleOverride(
 		suffix = consts.GroveRoleSuffixWorker
 	}
 
-	// Patch the PCLQ template named for the selected multinode role.
-	return patchNamedGroveTemplate(
+	// Insert the PCLQ topology subtree named for the selected multinode role.
+	return setNamedGroveTopologyConstraint(
 		result,
 		[]string{"spec", "template", "cliques"},
 		strings.ToLower(component.ComponentName+"-"+suffix),
-		override.Value.Raw,
+		override,
 	)
 }
 
@@ -224,7 +249,7 @@ func validateOverrideIdentity(
 		return err
 	}
 	if override.Target != expected {
-		return fmt.Errorf("target %q does not match resolved target %q", override.Target, expected)
+		return fmt.Errorf("unsupported Grove target %q; resolved target is %q", override.Target, expected)
 	}
 
 	// Recheck value ownership before the controller mutates provider resources.
@@ -234,13 +259,13 @@ func validateOverrideIdentity(
 	return nil
 }
 
-// patchNamedGroveTemplate merges a fragment into one named embedded target.
-// result must not be nil.
-func patchNamedGroveTemplate(
+// setNamedGroveTopologyConstraint sets the registered opaque subtree on one
+// named embedded target. result and override must not be nil.
+func setNamedGroveTopologyConstraint(
 	result *unstructured.Unstructured,
 	path []string,
 	name string,
-	patch []byte,
+	override *nvidiacomv1beta1.ProviderOverride,
 ) error {
 	// Read the generated list without assuming the destination exists.
 	items, found, err := unstructured.NestedSlice(result.Object, path...)
@@ -251,43 +276,45 @@ func patchNamedGroveTemplate(
 		return fmt.Errorf("generated destination %s[%q] was not found", strings.Join(path, "."), name)
 	}
 
-	// Merge only the generated entry whose stable name matches the DGD context.
+	// Decode the raw subtree once before locating its generated destination.
+	topologyConstraint, err := groveTopologyConstraint(override)
+	if err != nil {
+		return err
+	}
+
+	// Set only the generated entry whose stable name matches the DGD context.
 	for i := range items {
 		item, ok := items[i].(map[string]interface{})
 		if !ok || item["name"] != name {
 			continue
 		}
-		patched, err := mergeJSONObjects(item, patch)
-		if err != nil {
-			return fmt.Errorf("merge value into %s[%q]: %w", strings.Join(path, "."), name, err)
-		}
-		items[i] = patched
+		item["topologyConstraint"] = runtime.DeepCopyJSONValue(topologyConstraint)
+		items[i] = item
 		return unstructured.SetNestedSlice(result.Object, items, path...)
 	}
 	return fmt.Errorf("generated destination %s[%q] was not found", strings.Join(path, "."), name)
 }
 
-// mergeJSONObjects applies one JSON object as a Merge Patch to another; patch must encode a JSON object.
-func mergeJSONObjects(destination map[string]interface{}, patch []byte) (map[string]interface{}, error) {
-	// Encode the rendered destination before applying JSON Merge Patch semantics.
-	destinationJSON, err := json.Marshal(destination)
-	if err != nil {
-		return nil, err
+// groveTopologyConstraint extracts the raw opaque subtree registered for one
+// Grove target. override must not be nil.
+func groveTopologyConstraint(override *nvidiacomv1beta1.ProviderOverride) (interface{}, error) {
+	// Decode without a provider struct so unknown fields and explicit nulls survive.
+	var value map[string]interface{}
+	if err := sigsjson.UnmarshalCaseSensitivePreserveInts(override.Value.Raw, &value); err != nil {
+		return nil, fmt.Errorf("decode value: %w", err)
 	}
 
-	// Apply the sparse provider fragment to the encoded destination.
-	mergedJSON, err := jsonpatch.MergePatch(destinationJSON, patch)
+	// Select the registered subtree path for the standalone or embedded target.
+	path := []string{"topologyConstraint"}
+	if override.Target == TargetPodCliqueSet {
+		path = []string{"spec", "template", "topologyConstraint"}
+	}
+	topologyConstraint, found, err := unstructured.NestedFieldNoCopy(value, path...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read value.%s: %w", strings.Join(path, "."), err)
 	}
-
-	// Decode while preserving integer widths used by unstructured Kubernetes objects.
-	var merged map[string]interface{}
-	if err := sigsjson.UnmarshalCaseSensitivePreserveInts(mergedJSON, &merged); err != nil {
-		return nil, err
+	if !found {
+		return nil, fmt.Errorf("value.%s is required", strings.Join(path, "."))
 	}
-	if merged == nil {
-		return nil, fmt.Errorf("merge result must be a JSON object")
-	}
-	return merged, nil
+	return runtime.DeepCopyJSONValue(topologyConstraint), nil
 }

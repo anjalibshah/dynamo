@@ -833,7 +833,7 @@ func ConvertFromProviderOverride(src *ProviderOverride, dst *v1beta1.ProviderOve
 	*dst = v1beta1.ProviderOverride{
 		APIVersion: src.APIVersion,
 		Target:     src.Target,
-		Value:      src.Value,
+		Value:      *src.Value.DeepCopy(),
 	}
 }
 
@@ -843,7 +843,7 @@ func ConvertToProviderOverride(src *v1beta1.ProviderOverride, dst *ProviderOverr
 	*dst = ProviderOverride{
 		APIVersion: src.APIVersion,
 		Target:     src.Target,
-		Value:      src.Value,
+		Value:      *src.Value.DeepCopy(),
 	}
 }
 
@@ -1754,6 +1754,7 @@ func restoreSharedPodTemplateHubOnlyFields(preserved *v1beta1.DynamoComponentDep
 	restoreSharedPodTemplateContainerOrder(out, preserved.PodTemplate)
 	restoreSharedHubOnlyPodTemplateMetadata(&out.ObjectMeta, preserved.PodTemplate.ObjectMeta)
 	restoreSharedHubOnlyFlatVolumeMountFields(out, preserved.PodTemplate, src)
+	restoreSharedPodTemplateMainVolumeMountOrder(out, preserved.PodTemplate)
 	if podTemplateIsZero(preserved.PodTemplate) && podTemplateIsZero(out) {
 		return out, nil
 	}
@@ -1859,6 +1860,39 @@ func restoreSharedPodTemplateContainerOrder(dst, preserved *corev1.PodTemplateSp
 	}
 	out = append(out, remaining...)
 	dst.Spec.Containers = out
+}
+
+// restoreSharedPodTemplateMainVolumeMountOrder restores a saved main-container
+// mount order when every saved mount still exists. dst and preserved must not be nil.
+func restoreSharedPodTemplateMainVolumeMountOrder(dst, preserved *corev1.PodTemplateSpec) {
+	// Resolve the current and saved main containers without creating missing shape.
+	var dstMain *corev1.Container
+	for i := range dst.Spec.Containers {
+		if dst.Spec.Containers[i].Name == mainContainerName {
+			dstMain = &dst.Spec.Containers[i]
+			break
+		}
+	}
+	preservedMain, found := findContainerByName(preserved.Spec.Containers, mainContainerName)
+	if dstMain == nil || !found || len(preservedMain.VolumeMounts) < 2 ||
+		len(preservedMain.VolumeMounts) != len(dstMain.VolumeMounts) {
+		return
+	}
+
+	// Reorder current values only when the saved identity set matches exactly.
+	remaining := cloneNativeVolumeMounts(dstMain.VolumeMounts)
+	ordered := make([]corev1.VolumeMount, 0, len(remaining))
+	for _, savedMount := range preservedMain.VolumeMounts {
+		index := slices.IndexFunc(remaining, func(current corev1.VolumeMount) bool {
+			return current.Name == savedMount.Name && current.MountPath == savedMount.MountPath
+		})
+		if index < 0 {
+			return
+		}
+		ordered = append(ordered, remaining[index])
+		remaining = slices.Delete(remaining, index, index+1)
+	}
+	dstMain.VolumeMounts = ordered
 }
 
 func dropGeneratedMainContainer(dst, preserved *corev1.PodTemplateSpec, compilationCache *v1beta1.CompilationCacheConfig, src *DynamoComponentDeploymentSharedSpec) {

@@ -60,6 +60,9 @@ const (
 	reasonWaitingForCheckpoint                Reason = "waiting_for_checkpoint"
 	reasonSelectedWorkloadProviderUnavailable Reason = "selected_workload_provider_unavailable"
 	reasonUnsupportedWorkloadProvider         Reason = "unsupported_workload_provider"
+	reasonProviderOverrideInvalid             Reason = "provider_override_invalid"
+	reasonProviderValidationUnavailable       Reason = "provider_validation_unavailable"
+	reasonProviderProgramUnavailable          Reason = "provider_program_unavailable"
 
 	dgdComponentPodIndex = ".metadata.dgdComponent"
 )

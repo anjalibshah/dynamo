@@ -11,6 +11,7 @@ import (
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	internalwebhook "github.com/ai-dynamo/dynamo/deploy/operator/internal/webhook"
 	webhookdefaulting "github.com/ai-dynamo/dynamo/deploy/operator/internal/webhook/defaulting"
@@ -28,6 +29,7 @@ type Options struct {
 	// dynamo-planner:<OperatorVersion>.
 	DGDRDefaultImage  string
 	OperatorPrincipal string
+	SecretsRetriever  dynamo.SecretsRetriever
 	Gate              features.Gate
 }
 
@@ -57,7 +59,15 @@ func Setup(mgr ctrl.Manager, opts Options) error {
 		return fmt.Errorf("unable to register DynamoComponentDeployment webhook: %w", err)
 	}
 
-	dgdHandler := webhookvalidation.NewDynamoGraphDeploymentHandler(mgr, opts.OperatorPrincipal)
+	dgdHandler := webhookvalidation.NewDynamoGraphDeploymentHandler(
+		mgr,
+		webhookvalidation.DynamoGraphDeploymentHandlerOptions{
+			OperatorPrincipal: opts.OperatorPrincipal,
+			Config:            opts.Config,
+			RuntimeConfig:     opts.RuntimeConfig,
+			SecretsRetriever:  opts.SecretsRetriever,
+		},
+	)
 	if err := dgdHandler.RegisterWithManager(mgr, gate); err != nil {
 		return fmt.Errorf("unable to register DynamoGraphDeployment webhook: %w", err)
 	}

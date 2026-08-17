@@ -2204,6 +2204,41 @@ var dgdPropagatedAnnotationKeys = []string{
 	commonconsts.KubeAnnotationVLLMDistributedExecutorBackend,
 }
 
+// groveDirectProgramAnnotationKeys lists metadata annotations consumed directly
+// by Grove pathway selection or PodCliqueSet rendering.
+var groveDirectProgramAnnotationKeys = []string{
+	commonconsts.KubeAnnotationWorkloadProvider,
+	commonconsts.KubeAnnotationGroveUpdateStrategy,
+	commonconsts.KubeAnnotationKaiSchedulerQueue,
+	commonconsts.KubeAnnotationVolcanoQueue,
+}
+
+// GroveProgramAnnotations projects DGD metadata to the annotations consumed or
+// propagated by Grove rendering.
+func GroveProgramAnnotations(annotations map[string]string) map[string]string {
+	projected := make(map[string]string, len(groveDirectProgramAnnotationKeys)+len(dgdPropagatedAnnotationKeys))
+
+	// Preserve direct renderer inputs without forwarding unrelated metadata.
+	for _, key := range groveDirectProgramAnnotationKeys {
+		if value, exists := annotations[key]; exists {
+			projected[key] = value
+		}
+	}
+
+	// Share the propagation allowlist with component rendering.
+	for _, key := range dgdPropagatedAnnotationKeys {
+		if value, exists := annotations[key]; exists {
+			projected[key] = value
+		}
+	}
+
+	// Normalize nil and empty metadata to the same provider-program input.
+	if len(projected) == 0 {
+		return nil
+	}
+	return projected
+}
+
 // propagateDGDAnnotations copies DGD-level annotations into the component
 // annotations so that downstream logic can read them uniformly.
 // Service-level annotations take precedence (are never overwritten).
@@ -2490,6 +2525,9 @@ func GenerateGrovePodCliqueSet(
 		return nil, fmt.Errorf("cannot render Grove PodCliqueSet without runtime configuration")
 	}
 
+	// Keep rendering and admission change detection on the same metadata projection.
+	programAnnotations := GroveProgramAnnotations(dynamoDeployment.Annotations)
+
 	gangSet := &grovev1alpha1.PodCliqueSet{}
 	gangSet.Name = PCSNameForDGD(dynamoDeployment.Name, dynamoDeployment.Spec.Components)
 	gangSet.Namespace = dynamoDeployment.Namespace
@@ -2501,9 +2539,9 @@ func GenerateGrovePodCliqueSet(
 	gangSet.Annotations = maps.Clone(dynamoDeployment.Spec.Annotations)
 	// Volcano queue selection is consumed by Grove from the PodCliqueSet annotation.
 	// KAI-Scheduler is injected later on each clique via schedulerName and queue label.
-	injectVolcanoQueueAnnotation(gangSet, dynamoDeployment.Annotations, runtimeConfig)
+	injectVolcanoQueueAnnotation(gangSet, programAnnotations, runtimeConfig)
 	gangSet.Spec.Replicas = 1
-	updateStrategy, err := groveUpdateStrategyFromAnnotations(dynamoDeployment.Annotations)
+	updateStrategy, err := groveUpdateStrategyFromAnnotations(programAnnotations)
 	if err != nil {
 		return nil, err
 	}
@@ -2525,13 +2563,13 @@ func GenerateGrovePodCliqueSet(
 	// specToGroveTopologyConstraint returns nil when input is nil, so this is a no-op without TAS.
 	gangSet.Spec.Template.TopologyConstraint = specToGroveTopologyConstraint(dynamoDeployment.Spec.TopologyConstraint)
 
-	validatedQueueName, err := resolveGroveSchedulerQueue(ctx, dynamoDeployment.Annotations, runtimeConfig)
+	validatedQueueName, err := resolveGroveSchedulerQueue(ctx, programAnnotations, runtimeConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	discoveryBackend := controller_common.GetDiscoveryBackend(operatorConfig.Discovery.Backend, dynamoDeployment.Annotations)
-	discoveryContext := NewDiscoveryContext(operatorConfig.Discovery.Backend, dynamoDeployment.Annotations)
+	discoveryBackend := controller_common.GetDiscoveryBackend(operatorConfig.Discovery.Backend, programAnnotations)
+	discoveryContext := NewDiscoveryContext(operatorConfig.Discovery.Backend, programAnnotations)
 
 	var groveClusterTopologyDomains []v1beta1.TopologyDomain
 	if dynamoDeployment.Spec.Experimental != nil {
@@ -2550,7 +2588,7 @@ func GenerateGrovePodCliqueSet(
 		componentName := component.ComponentName
 		dynamoNamespace := GetDynamoNamespace(dynamoDeployment, component)
 
-		propagateDGDAnnotations(dynamoDeployment.GetAnnotations(), component)
+		propagateDGDAnnotations(programAnnotations, component)
 		podTemplate := ensurePodTemplate(component)
 		podTemplate.Labels[commonconsts.KubeLabelDynamoNamespace] = dynamoNamespace
 		// Determine backend framework using hybrid approach

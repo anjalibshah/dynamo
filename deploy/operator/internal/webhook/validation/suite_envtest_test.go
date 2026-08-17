@@ -22,6 +22,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/testing/operatorenv"
 	webhooksetup "github.com/ai-dynamo/dynamo/deploy/operator/internal/webhook/setup"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	grovecrds "github.com/ai-dynamo/grove/operator/api/core/v1alpha1/crds"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -66,8 +68,17 @@ var (
 		SetupWebhooks:     setupAdmissionWebhooks,
 		OperatorVersion:   "1.1.0",
 		OperatorPrincipal: admissionOperatorPrincipal,
+		CRDs:              []*apiextensionsv1.CustomResourceDefinition{podCliqueSetCRD()},
 	})
 )
+
+func podCliqueSetCRD() *apiextensionsv1.CustomResourceDefinition {
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := yaml.Unmarshal([]byte(grovecrds.PodCliqueSetCRD()), crd); err != nil {
+		panic(fmt.Sprintf("decode Grove PodCliqueSet CRD: %v", err))
+	}
+	return crd
+}
 
 func TestMain(m *testing.M) {
 	os.Exit(admissionEnv.RunM(m))

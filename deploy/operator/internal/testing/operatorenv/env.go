@@ -22,6 +22,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/podcache"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -79,6 +80,8 @@ type Options struct {
 
 	// CRDDirectoryPaths overrides the default CRD directories loaded by envtest.
 	CRDDirectoryPaths []string
+	// CRDs installs additional in-memory CRDs alongside CRDDirectoryPaths.
+	CRDs []*apiextensionsv1.CustomResourceDefinition
 	// BinaryAssetsDirectory overrides the envtest Kubernetes binary directory.
 	BinaryAssetsDirectory string
 	// EventuallyTimeout controls startup and cache synchronization timeouts.
@@ -190,6 +193,7 @@ func startRuntime(opts Options) (*runtimeEnv, error) {
 	testEnv := &envtest.Environment{
 		Scheme:                scheme,
 		CRDDirectoryPaths:     crdDirectoryPaths(opts),
+		CRDs:                  opts.CRDs,
 		ErrorIfCRDPathMissing: false,
 		BinaryAssetsDirectory: binaryAssetsDirectory(opts),
 		WebhookInstallOptions: webhookOptions,

@@ -1623,6 +1623,26 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 			}),
 		},
 		{
+			name:          "first provider override can be added without lifecycle history",
+			oldDeployment: betaDGDForAdmission(nil),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"rack"}}}}}`,
+				)
+			}),
+		},
+		{
+			name: "provider override can be removed without lifecycle status",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"rack"}}}}}`,
+				)
+			}),
+			deployment: betaDGDForAdmission(nil),
+		},
+		{
 			name: "valid Grove component and multinode role overrides are admitted and defaulted",
 			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
 				frontend := dgd.GetComponentByName("frontend")
@@ -1694,6 +1714,80 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 				)
 			}),
 			wantWebhookErrs: []string{`spec.providerOverride.value: Invalid value: null: does not match the registered PodCliqueSet schema: json: cannot unmarshal string into Go struct field TopologyConstraint.spec.template.topologyConstraint.pack of type v1alpha1.TopologyPackConstraint`},
+		},
+		{
+			name: "provider override must pass the installed Grove schema",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
+			wantWebhookErrs: []string{`spec: Invalid value: "provider program": dry-run Grove PodCliqueSet: .spec.template.topologyConstraint.futureProviderField: field not declared in schema`},
+		},
+		{
+			name: "provider-relevant update must pass the installed Grove schema",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"pack":{"required":"rack"}}}}}`,
+				)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
+			wantWebhookErrs: []string{`spec: Invalid value: "provider program": dry-run Grove PodCliqueSet: .spec.template.topologyConstraint.futureProviderField: field not declared in schema`},
+		},
+		{
+			name:               "provider-relevant annotation update must pass the installed Grove schema",
+			seedWithoutWebhook: true,
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{
+					consts.KubeAnnotationWorkloadProvider:    consts.WorkloadProviderGrove,
+					consts.KubeAnnotationGroveUpdateStrategy: "RollingRecreate",
+				}
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{
+					consts.KubeAnnotationWorkloadProvider:    consts.WorkloadProviderGrove,
+					consts.KubeAnnotationGroveUpdateStrategy: "OnDelete",
+				}
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
+			wantWebhookErrs: []string{`spec: Invalid value: "provider program": dry-run Grove PodCliqueSet: .spec.template.topologyConstraint.futureProviderField: field not declared in schema`},
+		},
+		{
+			name:               "unpropagated annotation update skips Grove provider validation",
+			seedWithoutWebhook: true,
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{
+					consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderGrove,
+				}
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{
+					consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderGrove,
+					"example.com/ticket":                  "DYNAMO-1234",
+				}
+				dgd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueSet,
+					`{"spec":{"template":{"topologyConstraint":{"futureProviderField":"unsupported"}}}}`,
+				)
+			}),
 		},
 		{
 			name: "typed and provider-native Grove topology cannot be combined",

@@ -130,8 +130,8 @@ func TestGroveProviderOverrideDryRunUsesInstalledCRDSchema(t *testing.T) {
 	}
 
 	t.Log("Reject the complete provider program during server-side dry-run")
-	_, err = reconciler.reconcileProviderOverridePodCliqueSet(ctx, dgd, desired)
-	require.ErrorContains(t, err, "dry-run PodCliqueSet provider program")
+	_, err = reconciler.reconcileGroveProviderProgram(ctx, dgd, desired)
+	require.ErrorContains(t, err, "validate Grove provider program")
 	require.ErrorContains(t, err, "futureProviderField")
 
 	t.Log("Verify the failed dry-run did not mutate the live workload")
@@ -150,9 +150,9 @@ func TestGroveProviderOverrideDryRunUsesInstalledCRDSchema(t *testing.T) {
 	rendered.Name = dgd.Name
 	supported, err := provideroverride.ApplyGroveOverrides(dgd, rendered)
 	require.NoError(t, err)
-	synced, err := reconciler.reconcileProviderOverridePodCliqueSet(ctx, dgd, supported)
+	result, err := reconciler.reconcileGroveProviderProgram(ctx, dgd, supported)
 	require.NoError(t, err)
-	require.NotNil(t, synced.Spec.Template.TopologyConstraint)
-	require.NotNil(t, synced.Spec.Template.TopologyConstraint.Pack)
-	assert.Equal(t, grovev1alpha1.TopologyDomain("rack"), synced.Spec.Template.TopologyConstraint.Pack.RequiredDomain)
+	require.NotNil(t, result.Spec.Template.TopologyConstraint)
+	require.NotNil(t, result.Spec.Template.TopologyConstraint.Pack)
+	assert.Equal(t, grovev1alpha1.TopologyDomain("rack"), result.Spec.Template.TopologyConstraint.Pack.RequiredDomain)
 }

@@ -23,8 +23,10 @@ import (
 	"strings"
 	"testing"
 
+	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -36,7 +38,7 @@ import (
 )
 
 func TestDynamoGraphDeploymentHandlerValidateCreate(t *testing.T) {
-	handler := NewDynamoGraphDeploymentHandler(newGroveTopologyTestManager(t), "system:serviceaccount:dynamo:dynamo-operator")
+	handler := newDynamoGraphDeploymentTestHandler(t, "system:serviceaccount:dynamo:dynamo-operator")
 	dgd := newBetaDGDForValidation()
 
 	warnings, err := handler.ValidateCreate(dgdAdmissionContext(admissionv1.Create, nvidiacomv1beta1.DynamoGraphDeploymentGVK), dgd)
@@ -63,7 +65,7 @@ func TestDynamoGraphDeploymentHandlerValidateCreate(t *testing.T) {
 }
 
 func TestDynamoGraphDeploymentHandlerValidateUpdate(t *testing.T) {
-	handler := NewDynamoGraphDeploymentHandler(newGroveTopologyTestManager(t), "system:serviceaccount:dynamo:dynamo-operator")
+	handler := newDynamoGraphDeploymentTestHandler(t, "system:serviceaccount:dynamo:dynamo-operator")
 	ctx := dgdAdmissionContext(admissionv1.Update, nvidiacomv1beta1.DynamoGraphDeploymentGVK)
 
 	t.Run("valid", func(t *testing.T) {
@@ -110,7 +112,7 @@ func TestDynamoGraphDeploymentHandlerValidateUpdate(t *testing.T) {
 		newDGD.Annotations = map[string]string{
 			consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderComponent,
 		}
-		unconfiguredHandler := NewDynamoGraphDeploymentHandler(newGroveTopologyTestManager(t), "")
+		unconfiguredHandler := newDynamoGraphDeploymentTestHandler(t, "")
 		if _, err := unconfiguredHandler.ValidateUpdate(ctx, oldDGD, newDGD); err != nil {
 			t.Fatalf("ValidateUpdate() error = %v, want optional operator identity to remain permissive", err)
 		}
@@ -118,7 +120,7 @@ func TestDynamoGraphDeploymentHandlerValidateUpdate(t *testing.T) {
 }
 
 func TestDynamoGraphDeploymentHandlerValidateDelete(t *testing.T) {
-	handler := NewDynamoGraphDeploymentHandler(newGroveTopologyTestManager(t), "")
+	handler := newDynamoGraphDeploymentTestHandler(t, "")
 	ctx := dgdAdmissionContext(admissionv1.Delete, nvidiacomv1beta1.DynamoGraphDeploymentGVK)
 
 	warnings, err := handler.ValidateDelete(ctx, newBetaDGDForValidation())
@@ -139,7 +141,10 @@ func TestDynamoGraphDeploymentHandlerRegisterWithManager(t *testing.T) {
 
 	server := ctrlwebhook.NewServer(ctrlwebhook.Options{})
 	mgr := &fakeManager{scheme: scheme, webhookServer: server}
-	handler := NewDynamoGraphDeploymentHandler(mgr, "")
+	handler := NewDynamoGraphDeploymentHandler(mgr, DynamoGraphDeploymentHandlerOptions{
+		Config:        &configv1alpha1.OperatorConfiguration{},
+		RuntimeConfig: &commoncontroller.RuntimeConfig{},
+	})
 	if err := handler.RegisterWithManager(mgr, features.Defaults()); err != nil {
 		t.Fatalf("RegisterWithManager() error = %v", err)
 	}
@@ -157,6 +162,15 @@ func TestDynamoGraphDeploymentHandlerRegisterWithManager(t *testing.T) {
 			t.Fatalf("registered pattern for %q = %q, want %q", tc.path, pattern, tc.wantPattern)
 		}
 	}
+}
+
+func newDynamoGraphDeploymentTestHandler(t *testing.T, operatorPrincipal string) *DynamoGraphDeploymentHandler {
+	t.Helper()
+	return NewDynamoGraphDeploymentHandler(newGroveTopologyTestManager(t), DynamoGraphDeploymentHandlerOptions{
+		OperatorPrincipal: operatorPrincipal,
+		Config:            &configv1alpha1.OperatorConfiguration{},
+		RuntimeConfig:     &commoncontroller.RuntimeConfig{},
+	})
 }
 
 func dgdAdmissionContext(operation admissionv1.Operation, gvk schema.GroupVersionKind) context.Context {

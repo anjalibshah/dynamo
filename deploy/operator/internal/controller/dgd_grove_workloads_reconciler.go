@@ -20,7 +20,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
@@ -29,14 +28,10 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/provideroverride"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/events"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -50,8 +45,6 @@ type groveWorkloadsReconciler struct {
 	scaler          *groveScaler
 	stableResources *groveStableResourcesReconciler
 }
-
-const groveProviderOverrideFieldOwner = "dynamo-operator-grove-provider-override"
 
 func newGroveWorkloadsReconciler(
 	kubeClient client.Client,
@@ -152,104 +145,9 @@ func (r *groveWorkloadsReconciler) reconcileRenderedPodCliqueSet(
 	// Apply sparse provider overrides before reconciling through the sticky SSA pathway.
 	providerObject, err := provideroverride.ApplyGroveOverrides(dgd, desired)
 	if err != nil {
-		return nil, fmt.Errorf("failed to apply Grove provider overrides: %w", err)
+		return nil, r.rejectGroveProviderProgram(ctx, desired, err)
 	}
-	return r.reconcileProviderOverridePodCliqueSet(ctx, dgd, providerObject)
-}
-
-// reconcileProviderOverridePodCliqueSet validates the complete rendered
-// provider object through the API server before mutating the live object. The
-// same unstructured payload is then applied atomically with one field manager,
-// preserving provider fields unknown to Dynamo's compiled Grove Go types. dgd
-// and desired must not be nil.
-func (r *groveWorkloadsReconciler) reconcileProviderOverridePodCliqueSet(
-	ctx context.Context,
-	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
-	desired *unstructured.Unstructured,
-) (*grovev1alpha1.PodCliqueSet, error) {
-	// Attach ownership before hashing so the dry-run and apply payloads match.
-	if err := ctrl.SetControllerReference(dgd, desired, r.syncer.Scheme()); err != nil {
-		return nil, fmt.Errorf("set PodCliqueSet controller reference: %w", err)
-	}
-
-	// Record the desired program hash on the object managed through SSA.
-	desiredHash, err := commoncontroller.GetSpecHash(desired)
-	if err != nil {
-		return nil, fmt.Errorf("hash PodCliqueSet provider program: %w", err)
-	}
-	desiredAnnotations := desired.GetAnnotations()
-	if desiredAnnotations == nil {
-		desiredAnnotations = make(map[string]string)
-	}
-	desiredAnnotations[commoncontroller.NvidiaAnnotationHashKey] = desiredHash
-	desired.SetAnnotations(desiredAnnotations)
-
-	// Reuse an unchanged typed object from the existing PodCliqueSet informer cache.
-	key := types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}
-	live := &grovev1alpha1.PodCliqueSet{}
-	if getErr := r.syncer.Get(ctx, key, live); getErr == nil {
-		annotations := live.GetAnnotations()
-		if annotations[commoncontroller.NvidiaAnnotationHashKey] == desiredHash &&
-			annotations[commoncontroller.NvidiaAnnotationGenerationKey] == strconv.FormatInt(live.GetGeneration(), 10) {
-			return live, nil
-		}
-	} else if !apierrors.IsNotFound(getErr) {
-		return nil, fmt.Errorf("get PodCliqueSet provider program %s: %w", key, getErr)
-	}
-
-	// Use strict Client.Apply dry-run against the installed CRD and webhooks.
-	applyOptions := []client.ApplyOption{
-		client.FieldOwner(groveProviderOverrideFieldOwner),
-		client.ForceOwnership,
-	}
-	if err := r.syncer.Apply(
-		ctx,
-		client.ApplyConfigurationFromUnstructured(desired.DeepCopy()),
-		append(applyOptions, client.DryRunAll)...,
-	); err != nil {
-		return nil, fmt.Errorf("dry-run PodCliqueSet provider program: %w", err)
-	}
-
-	// Apply the exact payload only after server-side validation succeeds.
-	if err := r.syncer.Apply(ctx, client.ApplyConfigurationFromUnstructured(desired), applyOptions...); err != nil {
-		return nil, fmt.Errorf("apply PodCliqueSet provider program: %w", err)
-	}
-
-	// Emit the mutation edge only after the provider workload write succeeds.
-	eventReason := "CreatePodCliqueSet"
-	eventAction := "Create"
-	eventMessage := "Created PodCliqueSet %s"
-	if live.GetResourceVersion() != "" {
-		eventReason = "UpdatePodCliqueSet"
-		eventAction = "Update"
-		eventMessage = "Updated PodCliqueSet %s"
-	}
-	r.syncer.GetRecorder().Eventf(desired, nil, corev1.EventTypeNormal, eventReason, eventAction, eventMessage, key)
-
-	// Checkpoint the server-returned generation without a read-after-write.
-	original := desired.DeepCopy()
-	annotations := desired.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-	annotations[commoncontroller.NvidiaAnnotationHashKey] = desiredHash
-	annotations[commoncontroller.NvidiaAnnotationGenerationKey] = strconv.FormatInt(desired.GetGeneration(), 10)
-	desired.SetAnnotations(annotations)
-	if err := r.syncer.Patch(
-		ctx,
-		desired,
-		client.MergeFrom(original),
-		client.FieldOwner(groveProviderOverrideFieldOwner),
-	); err != nil {
-		return nil, fmt.Errorf("checkpoint applied PodCliqueSet provider program: %w", err)
-	}
-
-	// Return the typed view used by the existing Grove readiness path.
-	synced := &grovev1alpha1.PodCliqueSet{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(desired.Object, synced); err != nil {
-		return nil, fmt.Errorf("convert applied PodCliqueSet %s: %w", key, err)
-	}
-	return synced, nil
+	return r.reconcileGroveProviderProgram(ctx, dgd, providerObject)
 }
 
 // managedByGroveProviderOverrideSSA reports whether this native workload has entered the sticky SSA pathway.
@@ -257,7 +155,7 @@ func (r *groveWorkloadsReconciler) reconcileProviderOverridePodCliqueSet(
 func managedByGroveProviderOverrideSSA(podCliqueSet *grovev1alpha1.PodCliqueSet) bool {
 	// Treat the durable field-manager entry as the pathway marker across override removal.
 	for _, entry := range podCliqueSet.ManagedFields {
-		if entry.Manager == groveProviderOverrideFieldOwner {
+		if entry.Manager == provideroverride.GroveFieldOwner {
 			return true
 		}
 	}

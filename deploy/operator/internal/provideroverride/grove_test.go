@@ -34,7 +34,7 @@ func TestApplyGroveOverrides(t *testing.T) {
 		Spec: nvidiacomv1beta1.DynamoGraphDeploymentSpec{
 			ProviderOverride: providerOverrideFixture(
 				TargetPodCliqueSet,
-				`{"spec":{"template":{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"rack"},"futureProviderField":{"enabled":true}}}}}`,
+				`{"spec":{"template":{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"rack"},"futureProviderField":{"enabled":true},"nullableProviderField":null}}}}`,
 			),
 			Components: []nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
 				{
@@ -102,6 +102,7 @@ func TestApplyGroveOverrides(t *testing.T) {
 
 	t.Log("Verify each fragment reached only its resolved destination")
 	assertNestedValue(t, got.Object, true, "spec", "template", "topologyConstraint", "futureProviderField", "enabled")
+	assertNestedValue(t, got.Object, nil, "spec", "template", "topologyConstraint", "nullableProviderField")
 	assertNamedNestedValue(t, got.Object, []string{"spec", "template", "cliques"}, "frontend", "host", "topologyConstraint", "pack", "required")
 	assertNamedNestedValue(t, got.Object, []string{"spec", "template", "podCliqueScalingGroups"}, "worker", "rack", "topologyConstraint", "pack", "required")
 	assertNamedNestedValue(t, got.Object, []string{"spec", "template", "cliques"}, "worker-"+consts.GroveRoleSuffixLeader, "host", "topologyConstraint", "pack", "required")
@@ -142,6 +143,21 @@ func TestApplyGroveOverridesRejectsMissingDestination(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `generated destination spec.template.cliques["missing"] was not found`) {
 		t.Fatalf("ApplyGroveOverrides() error = %v, want missing generated destination error", err)
+	}
+}
+
+func TestApplyGroveOverridesRejectsUnsupportedTarget(t *testing.T) {
+	t.Log("Build a root override with a target no longer registered by this release")
+	dgd := &nvidiacomv1beta1.DynamoGraphDeployment{
+		Spec: nvidiacomv1beta1.DynamoGraphDeploymentSpec{
+			ProviderOverride: providerOverrideFixture("RetiredPodCliqueSet", `{}`),
+		},
+	}
+
+	t.Log("Reject the stale target before applying the provider value")
+	_, err := ApplyGroveOverrides(dgd, &grovev1alpha1.PodCliqueSet{})
+	if err == nil || !strings.Contains(err.Error(), "unsupported Grove target") {
+		t.Fatalf("ApplyGroveOverrides() error = %v, want unsupported Grove target", err)
 	}
 }
 
