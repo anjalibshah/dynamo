@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Protocol, runtime_checkable
 
 from dynamo.workflow.generate import GenerateEndpointInvoker
-from dynamo.workflow.nixl import NixlTensorFanout, NixlTensorRef
+from dynamo.workflow.nixl import NixlTensorFanout, tensor_transfer_ref_from_dict
 from dynamo.workflow.plan import (
     NIXL_CARRIER,
     ExecutionPlan,
@@ -31,6 +32,8 @@ from dynamo.workflow.types import (
     WorkflowValidationError,
     _require_value_spec,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -179,9 +182,12 @@ class StageDispatcher:
                 raise WorkflowValidationError(
                     f"remote endpoint {endpoint_id!r} cannot mix stage protocols"
                 )
+            logger.info("Binding workflow endpoint %r", endpoint_id)
             endpoint = runtime.endpoint(endpoint_id)
             client = await endpoint.client()
+            logger.info("Waiting for workflow endpoint %r", endpoint_id)
             await client.wait_for_instances()
+            logger.info("Workflow endpoint %r is available", endpoint_id)
             clients[endpoint_id] = (
                 GenerateEndpointInvoker(client)
                 if protocols == {GenerateEndpointBinding}
@@ -215,7 +221,7 @@ class StageDispatcher:
             value = inputs[input_name]
             location = f"stage {stage_id!r} input {input_name!r}"
             if isinstance(binding, RemoteBinding) and value_spec.type == "tensor":
-                reference = NixlTensorRef.from_dict(value)
+                reference = tensor_transfer_ref_from_dict(value)
                 _validate_value(
                     value_spec,
                     SimpleNamespace(dtype=reference.dtype, shape=reference.shape),

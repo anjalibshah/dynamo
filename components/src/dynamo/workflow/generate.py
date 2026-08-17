@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol
 
 from dynamo.common.external_encoder import ExternalEncoderResult
-from dynamo.workflow.nixl import NixlTensorRef
+from dynamo.workflow.nixl import tensor_transfer_ref_from_dict
 from dynamo.workflow.perf import WORKFLOW_PERF_TRACE
 from dynamo.workflow.runtime import StageContext, WorkflowExecutionError
 from dynamo.workflow.types import StageContract
@@ -92,7 +92,9 @@ class GenerateEndpointInvoker:
         ):
             request.pop(field_name, None)
 
-        features = NixlTensorRef.from_dict(inputs[GENERATE_FEATURES_PORT]).to_dict()
+        features = tensor_transfer_ref_from_dict(
+            inputs[GENERATE_FEATURES_PORT]
+        ).to_dict()
         metadata = inputs[GENERATE_METADATA_PORT]
         try:
             encoder_result = ExternalEncoderResult.from_parts(

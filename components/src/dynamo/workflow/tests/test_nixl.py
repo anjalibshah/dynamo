@@ -22,6 +22,7 @@ from dynamo.workflow import (
     compile_workflow,
 )
 from dynamo.workflow.dispatcher import StageDispatcher
+from dynamo.workflow.nixl import EmbeddingTransferRef
 from dynamo.workflow.perf import WorkflowPerfTracer
 
 pytestmark = [
@@ -382,6 +383,27 @@ def test_tensor_reference_rejects_unknown_wire_fields() -> None:
 
     with pytest.raises(WorkflowExecutionError, match="unknown fields"):
         NixlTensorRef.from_dict(reference)
+
+
+def test_embedding_transfer_reference_uses_existing_request_shape() -> None:
+    reference = EmbeddingTransferRef(
+        shape=(3, 8),
+        dtype="torch.bfloat16",
+        serialized_request="opaque-write-handshake",
+        transfer_id="generator.embedding",
+    )
+
+    assert reference.to_dict() == {
+        "embeddings_shape": [3, 8],
+        "embedding_dtype_str": "bfloat16",
+        "serialized_request": "opaque-write-handshake",
+    }
+    assert (
+        EmbeddingTransferRef.from_dict(
+            reference.to_dict(), transfer_id="generator.embedding"
+        )
+        == reference
+    )
 
 
 TENSOR = ValueSpec(type="tensor", dtype="float32", shape=("dynamic", 8))
