@@ -11209,16 +11209,23 @@ spec:
                       properties:
                         providerOverride:
                           description: |-
-                            ProviderOverride carries a sparse provider-native configuration fragment for
-                            the DGD provider context in which it appears. Target is resolved and persisted
-                            by DGD admission.
+                            providerOverride configures the provider-native unit generated for this
+                            multinode role. It is supported only for components embedded in a DGD.
                           properties:
                             apiVersion:
+                              description: apiVersion selects the provider schema used to validate value.
                               minLength: 1
                               type: string
                             target:
+                              description: |-
+                                target identifies the provider resource kind or embedded provider schema.
+                                It may be omitted on input when the DGD location has one unambiguous target;
+                                admission resolves and persists it.
                               type: string
                             value:
+                              description: |-
+                                value is a sparse fragment of the selected provider schema. Admission
+                                restricts it to fields owned by the provider adapter for this context.
                               type: object
                               x-kubernetes-preserve-unknown-fields: true
                           required:
@@ -11240,16 +11247,23 @@ spec:
                       properties:
                         providerOverride:
                           description: |-
-                            ProviderOverride carries a sparse provider-native configuration fragment for
-                            the DGD provider context in which it appears. Target is resolved and persisted
-                            by DGD admission.
+                            providerOverride configures the provider-native unit generated for this
+                            multinode role. It is supported only for components embedded in a DGD.
                           properties:
                             apiVersion:
+                              description: apiVersion selects the provider schema used to validate value.
                               minLength: 1
                               type: string
                             target:
+                              description: |-
+                                target identifies the provider resource kind or embedded provider schema.
+                                It may be omitted on input when the DGD location has one unambiguous target;
+                                admission resolves and persists it.
                               type: string
                             value:
+                              description: |-
+                                value is a sparse fragment of the selected provider schema. Admission
+                                restricts it to fields owned by the provider adapter for this context.
                               type: object
                               x-kubernetes-preserve-unknown-fields: true
                           required:
@@ -11266,11 +11280,19 @@ spec:
                     this component when it is embedded in a DGD. Standalone DCDs reject it.
                   properties:
                     apiVersion:
+                      description: apiVersion selects the provider schema used to validate value.
                       minLength: 1
                       type: string
                     target:
+                      description: |-
+                        target identifies the provider resource kind or embedded provider schema.
+                        It may be omitted on input when the DGD location has one unambiguous target;
+                        admission resolves and persists it.
                       type: string
                     value:
+                      description: |-
+                        value is a sparse fragment of the selected provider schema. Admission
+                        restricts it to fields owned by the provider adapter for this context.
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                   required:

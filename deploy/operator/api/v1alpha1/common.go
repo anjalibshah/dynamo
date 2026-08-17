@@ -30,13 +30,19 @@ import (
 // the DGD provider context in which it appears. Target is resolved and persisted
 // by DGD admission.
 type ProviderOverride struct {
+	// apiVersion selects the provider schema used to validate value.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	APIVersion string `json:"apiVersion"`
 
+	// target identifies the provider resource kind or embedded provider schema.
+	// It may be omitted on input when the DGD location has one unambiguous target;
+	// admission resolves and persists it.
 	// +optional
 	Target string `json:"target,omitempty"`
 
+	// value is a sparse fragment of the selected provider schema. Admission
+	// restricts it to fields owned by the provider adapter for this context.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Type=object
@@ -45,6 +51,8 @@ type ProviderOverride struct {
 
 // MultinodeRoleSpec configures one explicit role of a multinode component.
 type MultinodeRoleSpec struct {
+	// providerOverride configures the provider-native unit generated for this
+	// multinode role. It is supported only for components embedded in a DGD.
 	// +optional
 	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
 }

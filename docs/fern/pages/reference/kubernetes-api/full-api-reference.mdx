@@ -1679,6 +1679,7 @@ MultinodeRoleSpec configures one explicit role of a multinode component.
 **Appears in:** [MultinodeSpec](#multinodespec)
 
 <ParamField path="providerOverride" type="ProviderOverride">
+providerOverride configures the provider-native unit generated for this multinode role. It is supported only for components embedded in a DGD.
 See [ProviderOverride](#provideroverride).
 **Validation:** Optional: \&#123;\&#125;
 </ParamField>
@@ -2050,14 +2051,17 @@ by DGD admission.
 **Appears in:** [DynamoComponentDeploymentSharedSpec](#dynamocomponentdeploymentsharedspec), [DynamoComponentDeploymentSpec](#dynamocomponentdeploymentspec), [DynamoGraphDeploymentSpec](#dynamographdeploymentspec), [MultinodeRoleSpec](#multinoderolespec)
 
 <ParamField path="apiVersion" type="string" required={true}>
+apiVersion selects the provider schema used to validate value.
 **Validation:** MinLength: 1  Required: \&#123;\&#125;
 </ParamField>
 
 <ParamField path="target" type="string">
+target identifies the provider resource kind or embedded provider schema. It may be omitted on input when the DGD location has one unambiguous target; admission resolves and persists it.
 **Validation:** Optional: \&#123;\&#125;
 </ParamField>
 
 <ParamField path="value" type="JSON" required={true}>
+value is a sparse fragment of the selected provider schema. Admission restricts it to fields owned by the provider adapter for this context.
 See [JSON](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#json-v1-apiextensions-k8s-io).
 **Validation:** Required: \&#123;\&#125;  Type: object
 </ParamField>

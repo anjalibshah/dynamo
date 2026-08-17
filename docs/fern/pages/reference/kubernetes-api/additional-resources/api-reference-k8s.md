@@ -1112,7 +1112,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `providerOverride` _[ProviderOverride](#provideroverride)_ |  |  | Optional: \{\} <br /> |
+| `providerOverride` _[ProviderOverride](#provideroverride)_ | providerOverride configures the provider-native unit generated for this<br />multinode role. It is supported only for components embedded in a DGD. |  | Optional: \{\} <br /> |
 
 
 #### MultinodeSpec
@@ -1422,9 +1422,9 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `apiVersion` _string_ |  |  | MinLength: 1 <br />Required: \{\} <br /> |
-| `target` _string_ |  |  | Optional: \{\} <br /> |
-| `value` _[JSON](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#json-v1-apiextensions-k8s-io)_ |  |  | Required: \{\} <br />Type: object <br /> |
+| `apiVersion` _string_ | apiVersion selects the provider schema used to validate value. |  | MinLength: 1 <br />Required: \{\} <br /> |
+| `target` _string_ | target identifies the provider resource kind or embedded provider schema.<br />It may be omitted on input when the DGD location has one unambiguous target;<br />admission resolves and persists it. |  | Optional: \{\} <br /> |
+| `value` _[JSON](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#json-v1-apiextensions-k8s-io)_ | value is a sparse fragment of the selected provider schema. Admission<br />restricts it to fields owned by the provider adapter for this context. |  | Required: \{\} <br />Type: object <br /> |
 
 
 #### ResourceItem
