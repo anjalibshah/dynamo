@@ -36,7 +36,8 @@ from typing import Callable, Optional
 
 
 class Policy(enum.Enum):
-    STATIC_CAP = "static_cap"   # A2
+    EAGER = "eager"             # A1 — admit everything immediately, never hold
+    STATIC_CAP = "static_cap"   # A0 (k=1) and A2 (k=K)
     FPM = "fpm"                 # A3
 
 
@@ -84,6 +85,7 @@ class PermitGate:
             raise ValueError("STATIC_CAP requires k >= 1")
         if policy is Policy.FPM and (load_fn is None or load_threshold is None):
             raise ValueError("FPM requires load_fn and load_threshold")
+        # EAGER needs no parameters; it admits everything.
         self.policy = policy
         self._send = send
         self._load_fn = load_fn
@@ -105,6 +107,8 @@ class PermitGate:
         return st
 
     def _has_opportunistic_slack(self, st: TaskState) -> bool:
+        if self.policy is Policy.EAGER:
+            return True
         if self.policy is Policy.STATIC_CAP:
             # One slot is reserved for the protected request; the remaining
             # k-1 are opportunistic.
