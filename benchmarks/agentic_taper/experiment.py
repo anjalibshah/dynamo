@@ -119,7 +119,7 @@ def build_cells(models, sweep: Sweep) -> list[Cell]:
 
 async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
                    dry_run: bool) -> Cell:
-    cfg = WorkloadConfig(n_tasks=200, fanout_k=cell.fanout_k,
+    cfg = WorkloadConfig(n_tasks=60 if dry_run else 200, fanout_k=cell.fanout_k,
                          burst_multiplier=cell.burst,
                          shared_prefix_blocks=cell.prefix_blocks,
                          agent_policy_class="agents", victim_policy_class="latency")
@@ -129,7 +129,9 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
     frontend = (MockFrontend(alpha=0.08) if dry_run
                 else HttpFrontend(model.base_url, model.served_model_name))
 
-    kwargs = {}
+    # Real runs keep true arrival timing; dry-runs compress it so the whole
+    # matrix executes offline in seconds.
+    kwargs = {"clock_scale": 0.02 if dry_run else 1.0}
     load_source = None
     if arm is Arm.A2:
         kwargs["k"] = int(cell.param)
