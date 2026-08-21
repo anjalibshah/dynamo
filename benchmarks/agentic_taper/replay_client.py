@@ -85,6 +85,8 @@ class MockFrontend:
     NOT a performance model; only enough structure to exercise the pipeline.
     """
 
+    needs_prompt = False  # mock ignores prompt text; skip synthesis for speed
+
     def __init__(self, base_ttft_ms=20.0, base_itl_ms=10.0, alpha=0.06, time_scale=0.001):
         self.base_ttft_ms = base_ttft_ms
         self.base_itl_ms = base_itl_ms
@@ -93,17 +95,21 @@ class MockFrontend:
         self.engine = None          # set by ReplayEngine for the in-flight view
 
     async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop):
+        # Sample the shared decode-step width once at dispatch. One sleep for the
+        # whole request (not per token): asyncio.sleep has a ~1 ms floor, so
+        # per-token sleeps would make an offline matrix take minutes. Overlap
+        # (hence load-dependence) still comes from open-loop arrivals + request
+        # duration.
         inflight = self.engine.inflight if self.engine else 1
-        ttft = self.base_ttft_ms * (1 + self.alpha * max(0, inflight - 1))
-        await asyncio.sleep(ttft * self.time_scale)
-        record.t_first_token = loop.time()
+        infl = max(0, inflight - 1)
+        ttft = self.base_ttft_ms * (1 + self.alpha * infl)
+        itl = self.base_itl_ms * (1 + self.alpha * infl)
+        n = max(1, min(max_tokens, 8))  # cap simulated tokens for speed
         record.ttft_ms = ttft
-        n = max(1, min(max_tokens, 8))  # cap simulated tokens for test speed
-        for _ in range(n):
-            inflight = self.engine.inflight if self.engine else 1
-            itl = self.base_itl_ms * (1 + self.alpha * max(0, inflight - 1))
-            await asyncio.sleep(itl * self.time_scale)
-            record.itls_ms.append(itl)
+        record.itls_ms = [itl] * n
+        total_ms = ttft + n * itl
+        await asyncio.sleep(total_ms * self.time_scale)
+        record.t_first_token = record.t_admit + ttft * self.time_scale
         record.t_done = loop.time()
         record.ok = True
 
@@ -114,6 +120,8 @@ class HttpFrontend:
     Uses aiohttp, imported lazily so this module loads without it. Parses SSE
     chunks to time first token and inter-token latencies client-side.
     """
+
+    needs_prompt = True
 
     def __init__(self, base_url: str, model: str, path: str = "/v1/completions",
                  timeout_s: float = 120.0):
@@ -176,7 +184,8 @@ def _is_protected(role: str) -> bool:
 class ReplayEngine:
     def __init__(self, rows: list[dict], arm: Arm, model: str, frontend, *,
                  k: Optional[int] = None, load_source=None, load_threshold=None,
-                 drain_interval_ms: float = 50.0, words_per_block: int = 400):
+                 drain_interval_ms: float = 50.0, words_per_block: int = 400,
+                 clock_scale: float = 1.0):
         self.rows = rows
         self.arm = arm
         self.model = model
@@ -188,6 +197,9 @@ class ReplayEngine:
         self.load_threshold = load_threshold
         self.drain_interval_ms = drain_interval_ms
         self.words_per_block = words_per_block
+        # Compress open-loop arrival timing. Keep 1.0 for real runs (true
+        # inter-arrival timing matters); use <1 only for fast offline dry-runs.
+        self.clock_scale = clock_scale
 
         self.by_id = {r["request_id"]: r for r in rows}
         self.done_events: dict[str, asyncio.Event] = {}
@@ -231,7 +243,10 @@ class ReplayEngine:
         self._loop.create_task(self._dispatch(row, rec))
 
     async def _dispatch(self, row: dict, rec: Timing) -> None:
-        prompt = synth_prompt(row["hash_ids"], self.words_per_block)
+        # Only synthesize the (expensive) shared-prefix prompt when the frontend
+        # actually sends it; the mock frontend ignores it.
+        prompt = (synth_prompt(row["hash_ids"], self.words_per_block)
+                  if getattr(self.frontend, "needs_prompt", True) else "")
         try:
             await self.frontend.complete(
                 prompt=prompt, max_tokens=row["output_length"],
@@ -248,7 +263,7 @@ class ReplayEngine:
     async def _feed(self, row: dict, t0: float) -> None:
         rec = self.records[row["request_id"]]
         # Open-loop arrival.
-        arrival = t0 + row.get("timestamp", 0.0) / 1000.0
+        arrival = t0 + (row.get("timestamp", 0.0) / 1000.0) * self.clock_scale
         delay = arrival - self._loop.time()
         if delay > 0:
             await asyncio.sleep(delay)

@@ -35,14 +35,23 @@ attributable to adaptivity, not to a different code path.
 | P0-1 | `load_source.py` — live FPM load signal for A3 | **done**; agg logic tested, network path box-only | bindings + engine |
 | P0-3 | `replay_client.py` — async DAG-honoring replay | **done**; full pipeline tested via mock frontend | HTTP path: frontend |
 | P0-8 | `experiment.py` — model × arm × sweep driver | **done**; wiring tested via `--dry-run` | live: frontend |
-| P0-5/7 | `analyze.py` — cross-cell stats + decision rules | TODO — consumes `results/*.jsonl` | no |
+| P0-5/7 | `analyze.py` — cross-cell stats + decision rules | **done, unit-tested** | no |
 | —    | `prompt_synth.py` — hash_ids → shared-prefix text | **done, unit-tested** | no |
 
 All modules **import and unit-test on any machine** (stdlib + msgspec). The real
 network paths — `HttpFrontend` (aiohttp → Dynamo OpenAI endpoint) and
 `FpmLoadSource` (dynamo bindings) — are exercised only on the 8×H100 box; both
 have offline stand-ins (`MockFrontend`, `MockLoadSource`) so the DAG, gate, and
-sweep logic are fully tested here. 39 tests, `python3 -m unittest discover -s tests`.
+sweep logic are fully tested here. 47 tests, `python3 -m unittest discover -s tests`.
+
+### Analysis & decision (offline)
+```bash
+python3 analyze.py --outdir ./results     # prints per-model H1/H2 verdicts, writes summary.json
+```
+`analyze.py` compares arms **at matched load** (near the knee), not averaged over
+the whole sweep — averaging saturates at easy loads and hides the effect. It
+reports the A1 throughput-trap curve, paired same-seed charged externality
+(A1−A0), and the H2 comparison of A3 vs best-tuned A2 on goodput and victim tail.
 
 ### Arms map onto one gate (one variable changes)
 | Arm | Gate config |
