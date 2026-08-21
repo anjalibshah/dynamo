@@ -31,14 +31,38 @@ attributable to adaptivity, not to a different code path.
 | # (brief) | Module | Status | Needs GPU? |
 |-----------|--------|--------|-----------|
 | P0-2 | `trace_gen.py` — seeded agentic Mooncake JSONL | **done, unit-tested** | no |
-| P0-4 | `permit_gate.py` — two-policy permit gate | **done, unit-tested** | no |
-| P0-1 | `fpm_source.py` — live load signal for A3 | interface below | binding + running engine |
-| P0-3 | `replay_client.py` — async DAG-honoring replay | interface below | running frontend |
-| P0-5/7 | `analyze.py` — span join → metrics | interface below | needs a run's spans |
+| P0-4 | `permit_gate.py` — EAGER / STATIC_CAP / FPM gate | **done, unit-tested** | no |
+| P0-1 | `load_source.py` — live FPM load signal for A3 | **done**; agg logic tested, network path box-only | bindings + engine |
+| P0-3 | `replay_client.py` — async DAG-honoring replay | **done**; full pipeline tested via mock frontend | HTTP path: frontend |
+| P0-8 | `experiment.py` — model × arm × sweep driver | **done**; wiring tested via `--dry-run` | live: frontend |
+| P0-5/7 | `analyze.py` — cross-cell stats + decision rules | TODO — consumes `results/*.jsonl` | no |
+| —    | `prompt_synth.py` — hash_ids → shared-prefix text | **done, unit-tested** | no |
 
-`trace_gen.py` and `permit_gate.py` run and test on any machine (stdlib only).
-The other three need the `dynamo._core` bindings and/or a running Dynamo+SGLang
-frontend, so they are built and run on the 8×H100 box, not here.
+All modules **import and unit-test on any machine** (stdlib + msgspec). The real
+network paths — `HttpFrontend` (aiohttp → Dynamo OpenAI endpoint) and
+`FpmLoadSource` (dynamo bindings) — are exercised only on the 8×H100 box; both
+have offline stand-ins (`MockFrontend`, `MockLoadSource`) so the DAG, gate, and
+sweep logic are fully tested here. 39 tests, `python3 -m unittest discover -s tests`.
+
+### Arms map onto one gate (one variable changes)
+| Arm | Gate config |
+|-----|-------------|
+| A0 | `STATIC_CAP, k=1` — one request per task at a time (baseline) |
+| A1 | `EAGER` — admit as soon as DAG deps clear |
+| A2 | `STATIC_CAP, k=K` — fixed per-task cap |
+| A3 | `FPM, load_threshold=τ` — task-aware on live `num_decode_requests` |
+
+### Two models
+`experiment.py`'s `MODELS` list runs the whole matrix per model. **Confirm
+`served_model_name` on the box** — the two entries are placeholders and the
+labels may not equal what the frontend serves. Tune `itl_slo_ms` per model
+(a 30B and a 27B decode at different rates).
+
+### Run the matrix
+```bash
+python3 experiment.py --dry-run --reps 1        # offline wiring check, no GPU
+python3 experiment.py --outdir ./results        # live, on the box
+```
 
 ## Run the tests (no GPU)
 
