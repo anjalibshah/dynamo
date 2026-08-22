@@ -112,6 +112,53 @@ class TestH2Verdict(unittest.TestCase):
         self.assertFalse(v["H2_supported"])
 
 
+class TestSloSweep(unittest.TestCase):
+    def test_victim_goodput_at_slo(self):
+        recs = [_rec("v0-req", "victim", [10.0]), _rec("v1-req", "victim", [20.0]),
+                _rec("v2-req", "victim", [30.0]), _rec("v3-req", "victim", [40.0])]
+        self.assertEqual(analyze.victim_goodput_at_slo(recs, 25.0), 0.5)   # 10,20 pass
+        self.assertEqual(analyze.victim_goodput_at_slo(recs, 5.0), 0.0)
+        self.assertEqual(analyze.victim_goodput_at_slo(recs, 100.0), 1.0)
+
+    def test_slo_sweep_recomputes_goodput_from_records(self):
+        d = tempfile.mkdtemp()
+        manifest = []
+        # A0 victim ITL 12 (fast), A1 victim ITL 40 (loaded). One workload, one rep.
+        for arm, itl, gp in [("A0", 12.0, 1.0), ("A1", 40.0, 0.0),
+                             ("A2", 30.0, 0.5), ("A3", 18.0, 0.9)]:
+            c = _cell("m", arm, 5, 8.0, 0, param=(2 if arm == "A2" else (8 if arm == "A3" else 0)),
+                      goodput=gp)
+            _write_cell(d, c, [_rec(f"v0-req", "victim", [itl])])
+            manifest.append(c)
+        # At SLO 15ms: A0 passes (12<=15), A1 fails (40>15) -> externality visible.
+        agg15 = analyze.aggregate(d, manifest, slo_ms=15.0)
+        a0 = analyze.arm_goodput_at_load(agg15, "m", "A0", 8.0)
+        a1 = analyze.arm_goodput_at_load(agg15, "m", "A1", 8.0)
+        self.assertEqual(a0, 1.0)
+        self.assertEqual(a1, 0.0)
+        # At SLO 50ms: everything passes -> no visible externality.
+        agg50 = analyze.aggregate(d, manifest, slo_ms=50.0)
+        self.assertEqual(analyze.arm_goodput_at_load(agg50, "m", "A1", 8.0), 1.0)
+
+    def test_summarize_includes_slo_sweep(self):
+        d = tempfile.mkdtemp()
+        manifest = []
+        for arm, itl in [("A0", 12.0), ("A1", 40.0), ("A2", 30.0), ("A3", 18.0)]:
+            for burst in (1.0, 8.0):
+                c = _cell("m", arm, 5, burst, 0,
+                          param=(2 if arm == "A2" else (8 if arm == "A3" else 0)))
+                _write_cell(d, c, [_rec("v0-req", "victim", [itl if burst == 8.0 else 10.0])])
+                manifest.append(c)
+        with open(os.path.join(d, "manifest.jsonl"), "w") as f:
+            for c in manifest:
+                f.write(json.dumps(c) + "\n")
+        s = analyze.summarize(d, slo_grid=(15.0, 50.0))
+        self.assertIn("slo_sweep", s)
+        self.assertIn("15.0", s["slo_sweep"])
+        self.assertIn("m", s["slo_sweep"]["15.0"])
+        self.assertIn("H2_supported", s["slo_sweep"]["15.0"]["m"])
+
+
 class TestEndToEnd(unittest.TestCase):
     def test_summarize_on_real_dry_run_output(self):
         # Run a tiny real dry-run matrix, then analyze it.

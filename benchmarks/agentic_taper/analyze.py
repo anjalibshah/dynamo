@@ -97,6 +97,19 @@ def _victim_mean_itls(records: list[dict]) -> list[float]:
             if r.get("role") == "victim" and r.get("itls_ms")]
 
 
+def victim_goodput_at_slo(records: list[dict], slo_ms: float) -> float:
+    """Fraction of victim (interactive) requests whose mean ITL meets the SLO.
+
+    Recomputed from the saved per-request ITLs, so any SLO can be evaluated
+    offline without re-running the arms — this is what makes the SLO a sweepable
+    knob rather than a value baked at run time.
+    """
+    vitls = _victim_mean_itls(records)
+    if not vitls:
+        return 0.0
+    return sum(1 for v in vitls if v <= slo_ms) / len(vitls)
+
+
 def cell_metrics(records: list[dict]) -> CellMetrics:
     vitls = _victim_mean_itls(records)
     ttfts = [r["ttft_ms"] for r in records if r.get("role") == "victim" and r.get("ttft_ms")]
@@ -172,13 +185,20 @@ class Agg:
     params_seen: list = field(default_factory=list)
 
 
-def aggregate(outdir: str, manifest: list[dict]) -> dict:
-    """Group by (model, arm, k, burst, pf, param); median/IQR across reps."""
+def aggregate(outdir: str, manifest: list[dict], slo_ms: Optional[float] = None) -> dict:
+    """Group by (model, arm, k, burst, pf, param); median/IQR across reps.
+
+    If ``slo_ms`` is given, goodput is recomputed from each cell's saved victim
+    ITLs at that SLO (the offline sweep); otherwise the run-time goodput from the
+    manifest is used.
+    """
     groups: dict = defaultdict(list)
     for c in manifest:
         gk = (c["model"], c["arm"], c["fanout_k"], c["burst"], c["prefix_blocks"], c.get("param", 0))
-        m = cell_metrics(load_records(outdir, c))
-        groups[gk].append((c.get("goodput", 0.0), m))
+        recs = load_records(outdir, c)
+        m = cell_metrics(recs)
+        good = victim_goodput_at_slo(recs, slo_ms) if slo_ms is not None else c.get("goodput", 0.0)
+        groups[gk].append((good, m))
     agg = {}
     for gk, rows in groups.items():
         goods = [g for g, _ in rows]
@@ -312,22 +332,18 @@ def h1_verdict(agg: dict, model: str, a1_knee: dict, ext: dict) -> dict:
 # summary + decision rules
 # --------------------------------------------------------------------------- #
 
-def summarize(outdir: str) -> dict:
-    manifest = load_manifest(outdir)
-    agg = aggregate(outdir, manifest)
-    models = sorted({c["model"] for c in manifest})
-    ext = charged_externality(outdir, manifest)
+DEFAULT_SLO_GRID = (15.0, 25.0, 50.0)
 
+
+def _verdicts_for_agg(agg: dict, models: list[str], ext: dict) -> dict:
     per_model = {}
     for model in models:
-        a1_curve = knee_curve(agg, model, "A1")
-        a0_curve = knee_curve(agg, model, "A0")
-        knee = detect_knee(a1_curve)
+        knee = detect_knee(knee_curve(agg, model, "A1"))
         h1 = h1_verdict(agg, model, knee, ext)
         h2 = h2_verdict(agg, model)
-
-        verdict = {
-            "A1_curve": a1_curve, "A0_curve": a0_curve,
+        per_model[model] = {
+            "A1_curve": knee_curve(agg, model, "A1"),
+            "A0_curve": knee_curve(agg, model, "A0"),
             "H1": h1,
             "H1_call": ("externality present; proceed to H2"
                         if h1["H1_supported"]
@@ -337,10 +353,44 @@ def summarize(outdir: str) -> dict:
                         if h2.get("H2_supported")
                         else "NEGATIVE — value not in dynamic gating; report and stop"),
         }
-        per_model[model] = verdict
+    return per_model
+
+
+def summarize(outdir: str, primary_slo: float = 25.0, slo_grid=DEFAULT_SLO_GRID) -> dict:
+    manifest = load_manifest(outdir)
+    models = sorted({c["model"] for c in manifest})
+    ext = charged_externality(outdir, manifest)
+
+    # Primary verdicts use VICTIM goodput at primary_slo, recomputed from saved
+    # ITLs — consistent with the sweep. (The manifest's run-time goodput is
+    # informational only; it may use an all-task definition or a different SLO.)
+    per_model = _verdicts_for_agg(aggregate(outdir, manifest, slo_ms=primary_slo), models, ext)
+
+    # Offline SLO sweep: recompute goodput from saved victim ITLs at each SLO,
+    # so we can report whether H1/H2 hold across plausible SLOs (robustness to
+    # the SLO choice) — no re-runs, purely from results/*.jsonl.
+    slo_grid = tuple(float(s) for s in slo_grid)
+    slo_sweep = {}
+    for slo in slo_grid:
+        agg_s = aggregate(outdir, manifest, slo_ms=slo)
+        pm = {}
+        for model in models:
+            knee = detect_knee(knee_curve(agg_s, model, "A1"))
+            h1 = h1_verdict(agg_s, model, knee, ext)
+            h2 = h2_verdict(agg_s, model)
+            a2 = best_param_at_load(agg_s, model, "A2", _loads(agg_s, model)[-1]) if _loads(agg_s, model) else None
+            a3 = best_param_at_load(agg_s, model, "A3", _loads(agg_s, model)[-1]) if _loads(agg_s, model) else None
+            pm[model] = {
+                "H1_supported": h1["H1_supported"],
+                "H2_supported": h2.get("H2_supported", False),
+                "best_A2_goodput": a2["goodput_median"] if a2 else None,
+                "best_A3_goodput": a3["goodput_median"] if a3 else None,
+            }
+        slo_sweep[str(slo)] = pm
 
     summary = {"models": models, "n_cells": len(manifest),
-               "per_model": per_model, "charged_externality": ext}
+               "per_model": per_model, "charged_externality": ext,
+               "slo_grid_ms": list(slo_grid), "slo_sweep": slo_sweep}
     with open(os.path.join(outdir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
     return summary
@@ -370,14 +420,33 @@ def _print_summary(summary: dict) -> None:
                   f"victim p95 ITL {h2['best_A3']['victim_itl_p95_median']:.1f}ms  (tau={h2['best_A3']['param']:g})")
         else:
             print(f"  H2  undecidable: {h2.get('reason')}")
+
+    sweep = summary.get("slo_sweep", {})
+    if sweep:
+        print("\n=== SLO robustness (H1 / H2 supported at each ITL SLO) ===")
+        slos = summary.get("slo_grid_ms", [])
+        for model in summary["models"]:
+            cells = []
+            for slo in slos:
+                pm = sweep.get(str(float(slo)), {}).get(model, {})
+                h1 = "H1✓" if pm.get("H1_supported") else "H1✗"
+                h2 = "H2✓" if pm.get("H2_supported") else "H2✗"
+                cells.append(f"{slo:>4g}ms:{h1}/{h2}")
+            print(f"  {model}:  " + "   ".join(cells))
+        print("  (H2✓ across all SLOs = the gate's win is robust to the SLO choice)")
     print(f"\nwrote {os.path.join('<outdir>', 'summary.json')}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Analyze Agentic TAPER P0 results.")
     p.add_argument("--outdir", default="./results")
+    p.add_argument("--slo-grid", default="15,25,50",
+                   help="comma-separated ITL SLOs (ms) for the offline robustness sweep")
+    p.add_argument("--primary-slo", type=float, default=25.0,
+                   help="ITL SLO (ms) for the primary verdict")
     a = p.parse_args()
-    summary = summarize(a.outdir)
+    grid = tuple(float(x) for x in a.slo_grid.split(","))
+    summary = summarize(a.outdir, primary_slo=a.primary_slo, slo_grid=grid)
     _print_summary(summary)
 
 
