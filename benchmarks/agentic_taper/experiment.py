@@ -48,14 +48,20 @@ class ModelSpec:
     ttft_slo_ms: float = 500.0
 
 
-# --- EDIT THESE on the box -------------------------------------------------- #
+# --- EDIT served_model_name on the box to match the Dynamo `--model` launch -- #
+# Backend: Dynamo + vLLM (both models have H100 vLLM recipes; FPM + KV-events
+# native). itl_slo_ms=20 is the starting anchor; the true SLO is swept offline in
+# analyze.py (--slo-grid) from the saved victim ITLs, so this value only sets the
+# run-time goodput column, not the final verdict. Confirm/tune per model after
+# the unloaded-ITL calibration (both are ~3B-active hybrid MoE, so a shared 20 ms
+# should be fair; verify the two unloaded p50s are within ~20%).
 MODELS = [
-    ModelSpec(label="nemotron35-lightning-30b",
-              served_model_name="CONFIRM/nemotron-3.5-lightning-30b",
-              itl_slo_ms=50.0),
-    ModelSpec(label="qwen38-27b",
-              served_model_name="CONFIRM/qwen-3.8-27b",
-              itl_slo_ms=50.0),
+    ModelSpec(label="nemotron-3.5-lightning-30b-a3b",
+              served_model_name="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+              itl_slo_ms=20.0),
+    ModelSpec(label="qwen3.6-35b-a3b",
+              served_model_name="Qwen/Qwen3.6-35B-A3B",
+              itl_slo_ms=20.0),
 ]
 # --------------------------------------------------------------------------- #
 
