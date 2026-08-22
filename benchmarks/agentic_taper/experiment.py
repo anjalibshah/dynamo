@@ -167,6 +167,13 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
     return cell
 
 
+# Shared across A3 cells so we build one DistributedRuntime / FPM subscriber for
+# the whole matrix, not one per cell.
+_RUNTIME = None
+_FPM_ENDPOINT = None
+_LIVE_FPM_SOURCE = None
+
+
 def _make_load_source(model: ModelSpec, dry_run: bool):
     if dry_run:
         from load_source import MockLoadSource
@@ -177,19 +184,52 @@ def _make_load_source(model: ModelSpec, dry_run: bool):
             def bind(self, engine):
                 self._e = engine
         return _Bindable()
-    # Real: needs a Dynamo component Endpoint that exposes the FPM stream.
-    # Acquire it from your DistributedRuntime on the box and pass it here.
-    from load_source import FpmLoadSource
-    endpoint = _acquire_fpm_endpoint(model)
-    src = FpmLoadSource(endpoint)
-    src.start()
-    return src
+    # Live: one FpmLoadSource, reused across all A3 cells.
+    global _LIVE_FPM_SOURCE
+    if _LIVE_FPM_SOURCE is None:
+        from load_source import FpmLoadSource
+        src = FpmLoadSource(_acquire_fpm_endpoint(model))
+        src.start()
+        _LIVE_FPM_SOURCE = src
+    return _LIVE_FPM_SOURCE
 
 
 def _acquire_fpm_endpoint(model: ModelSpec):
-    raise NotImplementedError(
-        "Wire the Dynamo FPM endpoint on the box: build a DistributedRuntime, "
-        "resolve the frontend/worker component, and return its FPM Endpoint.")
+    """Build (once) the Dynamo Endpoint that anchors FPM discovery.
+
+    ``FpmEventSubscriber`` auto-discovers publishers on the event plane, so this
+    only needs a ``DistributedRuntime`` plus the namespace/component/endpoint the
+    workers register under. This mirrors the shipped receiver
+    ``dynamo.common.recv_forward_pass_metrics`` exactly.
+
+    Configure via env to match your deployment (defaults are Dynamo's):
+      DYN_DISCOVERY_BACKEND  (default "etcd")
+      DYN_REQUEST_PLANE      (default "nats")
+      DYN_NAMESPACE          (default "dynamo")
+      DYN_FPM_COMPONENT      (default "backend")   # the worker component
+      DYN_FPM_ENDPOINT       (default "generate")
+
+    VERIFY FIRST on the box that FPM is flowing and that these names are right:
+      python -m dynamo.common.recv_forward_pass_metrics --mode tracking
+    then set the env vars here to whatever made that receiver see messages.
+    """
+    global _RUNTIME, _FPM_ENDPOINT
+    if _FPM_ENDPOINT is not None:
+        return _FPM_ENDPOINT
+    import asyncio as _asyncio
+
+    from dynamo.runtime import DistributedRuntime
+
+    loop = _asyncio.get_running_loop()
+    discovery = os.environ.get("DYN_DISCOVERY_BACKEND", "etcd")
+    request_plane = os.environ.get("DYN_REQUEST_PLANE", "nats")
+    namespace = os.environ.get("DYN_NAMESPACE", "dynamo")
+    component = os.environ.get("DYN_FPM_COMPONENT", "backend")
+    endpoint = os.environ.get("DYN_FPM_ENDPOINT", "generate")
+
+    _RUNTIME = DistributedRuntime(loop, discovery, request_plane)
+    _FPM_ENDPOINT = _RUNTIME.endpoint(f"{namespace}.{component}.{endpoint}")
+    return _FPM_ENDPOINT
 
 
 async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
