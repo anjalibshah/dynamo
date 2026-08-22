@@ -37,12 +37,29 @@ attributable to adaptivity, not to a different code path.
 | P0-8 | `experiment.py` — model × arm × sweep driver | **done**; wiring tested via `--dry-run` | live: frontend |
 | P0-5/7 | `analyze.py` — cross-cell stats + decision rules | **done, unit-tested** | no |
 | —    | `prompt_synth.py` — hash_ids → shared-prefix text | **done, unit-tested** | no |
+| —    | `trace_adapter.py` — real-trace (Mode A) adapter | **done, unit-tested** | no |
 
 All modules **import and unit-test on any machine** (stdlib + msgspec). The real
 network paths — `HttpFrontend` (aiohttp → Dynamo OpenAI endpoint) and
 `FpmLoadSource` (dynamo bindings) — are exercised only on the 8×H100 box; both
 have offline stand-ins (`MockFrontend`, `MockLoadSource`) so the DAG, gate, and
-sweep logic are fully tested here. 47 tests, `python3 -m unittest discover -s tests`.
+sweep logic are fully tested here. 60 tests, `python3 -m unittest discover -s tests`.
+
+### Mode A — validate against a real Claude Code trace
+Replay a *real* agent's fan-out through the same four arms to check the verdict
+holds (preserves the paired A0–A3 comparison — you replay one captured trace
+across all arms). Pipeline reuses existing Dynamo tooling:
+```
+claude_trace_export → request_trace_to_mooncake --agentic → AgenticMooncakeRow JSONL
+python3 trace_adapter.py --in agentic.jsonl --out replay.jsonl   # derive role/task/parent
+# then feed replay.jsonl to the replay client / experiment matrix
+```
+`trace_adapter.py` derives `role`/`task_id`/`parent` from the branch/join graph
+(root = has `branches`, join = has `wait_for`, branch = in a root's `branches`,
+else single) and is idempotent on already-labeled `trace_gen` rows. Note: a
+captured agent trace has no synthetic "victims" — its standalone turns become
+`single` tasks; inject synthetic victims (or designate `single`s) for the
+interactive SLO measurement.
 
 ### Analysis & decision (offline)
 ```bash

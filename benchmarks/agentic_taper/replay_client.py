@@ -176,9 +176,11 @@ class HttpFrontend:
 # --------------------------------------------------------------------------- #
 
 def _is_protected(role: str) -> bool:
-    # The task baseline that must always run: the victim's sole request and the
-    # aggressor's root. Branches and joins are opportunistic.
-    return role in ("victim", "root")
+    # The task baseline that must always run: the victim's sole request, the
+    # aggressor's root, and a standalone "single" request (its own whole task,
+    # e.g. a non-fan-out turn in a captured agent trace). Branches and joins are
+    # opportunistic.
+    return role in ("victim", "root", "single")
 
 
 class ReplayEngine:
