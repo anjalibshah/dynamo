@@ -56,11 +56,11 @@ class ModelSpec:
 # the unloaded-ITL calibration (both are ~3B-active hybrid MoE, so a shared 20 ms
 # should be fair; verify the two unloaded p50s are within ~20%).
 MODELS = [
-    # H100 vLLM recipe serves the NVFP4-DSpark variant (agg-h100-dspark). Use
-    # -NVFP4-DFlash instead if you deploy agg-h100-dflash. Confirm the exact
-    # string with:  curl -s http://<frontend>/v1/models | jq '.data[].id'
+    # agg-h100-dspark recipe: --served-model-name is the base NVFP4 id; the
+    # -DSpark variant is the speculative-decoding DRAFT (num_speculative_tokens=7),
+    # not the served model. Confirm with: curl -s http://<frontend>/v1/models | jq
     ModelSpec(label="nemotron-3.5-lightning-30b-a3b",
-              served_model_name="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+              served_model_name="nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
               itl_slo_ms=20.0),
     ModelSpec(label="qwen3.6-35b-a3b",
               served_model_name="Qwen/Qwen3.6-35B-A3B",
