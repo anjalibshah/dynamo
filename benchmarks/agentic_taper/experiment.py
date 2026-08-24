@@ -32,7 +32,7 @@ import asyncio
 import itertools
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from replay_client import (Arm, HttpFrontend, MockFrontend, ReplayEngine,
                            task_goodput, victim_tail, write_results)
@@ -245,10 +245,31 @@ async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
         done.append(res)
         print(f"[{i+1}/{len(cells)}] {res.name()}  goodput={res.goodput}  "
               f"victim_p95_itl={res.victim_p95_itl_ms}ms")
-    with open(os.path.join(outdir, "manifest.jsonl"), "w") as f:
-        for c in done:
-            f.write(json.dumps(asdict(c)) + "\n")
+    _merge_manifest(outdir, done)
     return done
+
+
+def _cell_key(d: dict) -> tuple:
+    return (d["model"], d["arm"], d["fanout_k"], d["burst"],
+            d["prefix_blocks"], d["param"], d["rep"])
+
+
+def _merge_manifest(outdir: str, done: list) -> None:
+    """Merge new cells into manifest.jsonl so per-model runs to the same outdir
+    accumulate instead of overwriting (deploy one model, run, swap, run)."""
+    path = os.path.join(outdir, "manifest.jsonl")
+    rows: dict = {}
+    if os.path.exists(path):
+        for line in open(path):
+            if line.strip():
+                d = json.loads(line)
+                rows[_cell_key(d)] = d
+    for c in done:
+        d = asdict(c)
+        rows[_cell_key(d)] = d
+    with open(path, "w") as f:
+        for d in rows.values():
+            f.write(json.dumps(d) + "\n")
 
 
 def main() -> None:
@@ -258,14 +279,33 @@ def main() -> None:
                    help="MockFrontend, no GPU — validate matrix wiring offline.")
     p.add_argument("--limit", type=int, default=None, help="run only first N cells")
     p.add_argument("--reps", type=int, default=None)
+    p.add_argument("--models", default=None,
+                   help="comma-separated model labels to run (default: all). "
+                        "Use one label to run just the model currently deployed; "
+                        "manifest.jsonl merges across runs to the same --outdir.")
+    p.add_argument("--base-url", default=None,
+                   help="override the frontend URL for all selected models "
+                        "(e.g. http://localhost:8000)")
     a = p.parse_args()
     sweep = Sweep()
     if a.reps is not None:
         sweep.reps = a.reps
-    cells = build_cells(MODELS, sweep)
-    print(f"matrix: {len(MODELS)} models x 4 arms x sweep = {len(cells)} cells "
+
+    models = MODELS
+    if a.models:
+        want = {s.strip() for s in a.models.split(",")}
+        models = [m for m in MODELS if m.label in want]
+        missing = want - {m.label for m in models}
+        if missing:
+            raise SystemExit(f"unknown model label(s): {sorted(missing)}; "
+                             f"available: {[m.label for m in MODELS]}")
+    if a.base_url:
+        models = [replace(m, base_url=a.base_url) for m in models]
+
+    cells = build_cells(models, sweep)
+    print(f"matrix: {len(models)} model(s) x 4 arms x sweep = {len(cells)} cells "
           f"({'DRY RUN' if a.dry_run else 'LIVE'})")
-    asyncio.run(run_matrix(MODELS, sweep, a.outdir, a.dry_run, a.limit))
+    asyncio.run(run_matrix(models, sweep, a.outdir, a.dry_run, a.limit))
 
 
 if __name__ == "__main__":
