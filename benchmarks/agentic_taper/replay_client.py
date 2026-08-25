@@ -59,6 +59,7 @@ class Timing:
     ttft_ms: float = 0.0
     itls_ms: list = field(default_factory=list)
     ok: bool = True
+    error: str = ""      # populated when ok is False, so failures aren't silent
 
     @property
     def gate_wait_ms(self) -> float:
@@ -134,7 +135,10 @@ class HttpFrontend:
     async def _ensure_session(self):
         if self._session is None:
             import aiohttp
-            self._session = aiohttp.ClientSession()
+            # Session-level timeout as a ClientTimeout (aiohttp rejects a bare
+            # float on the request call).
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout_s))
         return self._session
 
     async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop):
@@ -143,8 +147,7 @@ class HttpFrontend:
                 "temperature": 0.0, "stream": True}
         last = None
         try:
-            async with session.post(self.base_url + self.path, json=body, headers=headers,
-                                    timeout=self.timeout_s) as resp:
+            async with session.post(self.base_url + self.path, json=body, headers=headers) as resp:
                 resp.raise_for_status()
                 async for raw in resp.content:
                     line = raw.decode("utf-8", "ignore").strip()
@@ -162,8 +165,9 @@ class HttpFrontend:
                     last = now
                 record.t_done = loop.time()
                 record.ok = True
-        except Exception:
+        except Exception as e:
             record.ok = False
+            record.error = f"{type(e).__name__}: {e}"
             record.t_done = loop.time()
 
     async def close(self):
