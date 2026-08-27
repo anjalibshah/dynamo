@@ -27,6 +27,74 @@ class TestDeterminism(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class TestSiblingPlacement(unittest.TestCase):
+    """Option-D: distributed vs concentrated siblings, paired at matched load."""
+
+    def _cfg(self, distribute):
+        return WorkloadConfig(n_tasks=120, victim_frac=0.6, fanout_k=5,
+                              shared_prefix_blocks=8, branch_unique_blocks=2,
+                              distribute_siblings=distribute)
+
+    def test_concentrated_siblings_share_root_prefix(self):
+        rows = generate(self._cfg(False), seed=3)
+        by_task = {}
+        for r in rows:
+            by_task.setdefault(r.task_id, {})[r.role] = by_task.get(r.task_id, {}).get(r.role, [])
+        # gather per aggressor task: root prefix and each branch's leading run
+        agg = {}
+        for r in rows:
+            if r.task_kind != "aggressor":
+                continue
+            agg.setdefault(r.task_id, {"root": None, "branches": []})
+            if r.role == "root":
+                agg[r.task_id]["root"] = r.hash_ids
+            elif r.role == "branch":
+                agg[r.task_id]["branches"].append(r.hash_ids)
+        checked = 0
+        for t, d in agg.items():
+            pref = d["root"]
+            for bh in d["branches"]:
+                # concentrated: branch begins with the root's full prefix
+                self.assertEqual(bh[:len(pref)], pref)
+                checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_distributed_siblings_have_unique_prefixes(self):
+        rows = generate(self._cfg(True), seed=3)
+        agg = {}
+        for r in rows:
+            if r.task_kind != "aggressor":
+                continue
+            agg.setdefault(r.task_id, {"root": None, "branches": []})
+            if r.role == "root":
+                agg[r.task_id]["root"] = r.hash_ids
+            elif r.role == "branch":
+                agg[r.task_id]["branches"].append(r.hash_ids)
+        for t, d in agg.items():
+            pref = d["root"]
+            leads = [tuple(bh[:len(pref)]) for bh in d["branches"]]
+            # no branch shares the root prefix, and no two branches share a lead run
+            for lead in leads:
+                self.assertNotEqual(list(lead), pref)
+            self.assertEqual(len(set(leads)), len(leads))  # all distinct
+
+    def test_paired_invariant_only_hashids_differ(self):
+        # Same seed: request ids, timestamps, and input/output lengths must be
+        # identical across the two placement modes — only hash_ids may differ.
+        conc = {r.request_id: r for r in generate(self._cfg(False), seed=9)}
+        dist = {r.request_id: r for r in generate(self._cfg(True), seed=9)}
+        self.assertEqual(set(conc), set(dist))
+        for rid, rc in conc.items():
+            rd = dist[rid]
+            self.assertEqual(rc.timestamp, rd.timestamp)
+            self.assertEqual(rc.input_length, rd.input_length)
+            self.assertEqual(rc.output_length, rd.output_length)
+            self.assertEqual(rc.wait_for, rd.wait_for)
+            self.assertEqual(len(rc.hash_ids), len(rd.hash_ids))  # same block count
+            if rc.role == "branch":
+                self.assertNotEqual(rc.hash_ids, rd.hash_ids)     # placement differs
+
+
 class TestStructure(unittest.TestCase):
     def setUp(self):
         self.cfg = WorkloadConfig(n_tasks=300, victim_frac=0.6, fanout_k=5,
