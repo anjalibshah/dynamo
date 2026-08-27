@@ -14,8 +14,15 @@ One gate, two policies, so an A3 win over A2 is attributable to adaptivity and
 not to a different code path:
 
 * ``STATIC_CAP`` (A2): admit up to ``k`` concurrent requests per task.
-* ``FPM`` (A3): admit opportunistic siblings only while a live load signal is
-  under ``load_threshold``.
+* ``FPM`` (A3): admit opportunistic siblings only while the live load signal
+  permits. Two forms of "permits":
+    - **budget rule** (faithful to TAPER's ``T(S) <= T0 + rho*B_t``): admit iff
+      the *projected* victim ITL after adding this sibling stays within the SLO —
+      ``latency_model.itl_at(load + 1) <= slo_ms``. No free threshold; the bar is
+      derived from the SLO budget and the calibrated load->latency model.
+    - **raw threshold** (legacy / ablation): admit iff ``load <= load_threshold``.
+      A hardcoded tau, kept only so we can show the swept value matches the
+      budget-derived boundary.
 
 Both policies always admit the one **protected** request per task, so baseline
 progress is never blocked (brief §3, H2). Held requests are never rejected; they
@@ -80,17 +87,27 @@ class PermitGate:
         load_fn: Optional[Callable[[], float]] = None,
         k: Optional[int] = None,
         load_threshold: Optional[float] = None,
+        latency_model=None,
+        slo_ms: Optional[float] = None,
     ) -> None:
         if policy is Policy.STATIC_CAP and (k is None or k < 1):
             raise ValueError("STATIC_CAP requires k >= 1")
-        if policy is Policy.FPM and (load_fn is None or load_threshold is None):
-            raise ValueError("FPM requires load_fn and load_threshold")
+        if policy is Policy.FPM:
+            if load_fn is None:
+                raise ValueError("FPM requires load_fn")
+            budget = latency_model is not None and slo_ms is not None
+            if not budget and load_threshold is None:
+                raise ValueError(
+                    "FPM requires either (latency_model + slo_ms) for the budget "
+                    "rule, or load_threshold for the legacy threshold")
         # EAGER needs no parameters; it admits everything.
         self.policy = policy
         self._send = send
         self._load_fn = load_fn
         self.k = k
         self.load_threshold = load_threshold
+        self._latency_model = latency_model
+        self._slo_ms = slo_ms
         self.tasks: dict[str, TaskState] = {}
         # Counters for the "admitted vs. held width" metric (brief §3).
         self.n_admitted_protected = 0
@@ -114,7 +131,13 @@ class PermitGate:
             # k-1 are opportunistic.
             return st.inflight < self.k
         # FPM: gate on live load, independent of per-task count.
-        return self._load_fn() <= self.load_threshold
+        load = self._load_fn()
+        if self._latency_model is not None:
+            # Budget rule (TAPER T(S) <= T0 + rho*B_t): admitting this sibling
+            # takes decode load to load+1; require the projected victim ITL there
+            # to stay within the SLO budget. No free threshold.
+            return self._latency_model.itl_at(load + 1) <= self._slo_ms
+        return load <= self.load_threshold  # legacy raw threshold
 
     def submit(self, req: GateRequest) -> None:
         """Admit or hold ``req``.
