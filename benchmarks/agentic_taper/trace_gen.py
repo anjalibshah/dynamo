@@ -111,6 +111,13 @@ class WorkloadConfig:
     mean_arrival_ms: float = 50.0      # Poisson inter-arrival at 1x
     burst_multiplier: float = 1.0      # {1,3,8} — divides inter-arrival
     branch_launch_jitter_ms: float = 0.0  # 0 => siblings launch simultaneously
+    # Option-D baseline knob. False: branches share the root prefix -> KV-aware
+    # routing CONCENTRATES them on one worker (the fan-out externality). True: each
+    # branch gets its own prefix -> routing SPREADS them (the distributed
+    # counterfactual). Only the hash-id prefix changes; request ids, timestamps,
+    # and input/output lengths are identical, so the two traces are paired at
+    # matched load. Requires >=2 workers + KV-aware routing to have any effect.
+    distribute_siblings: bool = False
     victim_policy_class: Optional[str] = None
     agent_policy_class: Optional[str] = None
     block_size: int = DEFAULT_BLOCK_SIZE
@@ -174,13 +181,21 @@ def _aggressor(cfg, alloc, rng, t, ts) -> list[Row]:
         bid = f"{sid}-b{b}"
         branch_ids.append(bid)
         jitter = rng.uniform(0, cfg.branch_launch_jitter_ms) if cfg.branch_launch_jitter_ms else 0.0
+        # Concentrated (default): extend the shared root prefix -> siblings share a
+        # leading id run -> KV-aware routing co-locates them. Distributed: give each
+        # branch its own fresh prefix -> no overlap -> routing spreads them. Same
+        # block count either way, so input_length is unchanged.
+        if cfg.distribute_siblings:
+            b_hash = alloc.extend(alloc.fresh(cfg.shared_prefix_blocks), cfg.branch_unique_blocks)
+        else:
+            b_hash = alloc.extend(prefix, cfg.branch_unique_blocks)
         branches.append(Row(
             request_id=bid,
             session_id=bid,               # distinct id => co-locate via KV overlap, not affinity
             parent=sid,                    # real lineage for x-dynamo-parent-session-id
             input_length=(cfg.shared_prefix_blocks + cfg.branch_unique_blocks) * cfg.block_size,
             output_length=cfg.branch_osl,
-            hash_ids=alloc.extend(prefix, cfg.branch_unique_blocks),
+            hash_ids=b_hash,
             timestamp=round(ts + jitter, 3),  # jitter=0 => simultaneous launch
             policy_class=cfg.agent_policy_class,
             task_id=sid,
@@ -219,6 +234,7 @@ def _build_cfg(a: argparse.Namespace) -> WorkloadConfig:
         shared_prefix_blocks=a.shared_prefix_blocks,
         burst_multiplier=a.burst_multiplier,
         branch_launch_jitter_ms=a.branch_launch_jitter_ms,
+        distribute_siblings=a.distribute_siblings,
         victim_policy_class=a.victim_policy_class,
         agent_policy_class=a.agent_policy_class,
         block_size=a.block_size,
@@ -235,6 +251,11 @@ def main() -> None:
     p.add_argument("--shared-prefix-blocks", type=int, default=8)
     p.add_argument("--burst-multiplier", type=float, default=1.0)
     p.add_argument("--branch-launch-jitter-ms", type=float, default=0.0)
+    p.add_argument("--distribute-siblings", action="store_true",
+                   help="Option-D baseline: give each branch its own prefix so "
+                        "routing SPREADS the fan-out across workers (vs the default "
+                        "shared prefix that concentrates it). Paired with the "
+                        "concentrated trace at matched load.")
     p.add_argument("--victim-policy-class", default=None)
     p.add_argument("--agent-policy-class", default=None)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
