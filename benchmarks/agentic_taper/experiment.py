@@ -34,10 +34,22 @@ import json
 import os
 from dataclasses import asdict, dataclass, field, replace
 
+import statistics
+
+from calibration import LoadSampler, summarize_calibration
+from latency_model import LatencyModel
 from replay_client import (Arm, HttpFrontend, MockFrontend, ReplayEngine,
                            apply_server_metrics, parse_frontend_metrics,
                            task_goodput, victim_tail, write_results)
 from trace_gen import WorkloadConfig, generate
+
+
+def _victim_mean_itl(records) -> float:
+    """Central victim ITL (mean over victim per-request mean ITLs) — the y for
+    calibration points."""
+    vals = [statistics.mean(r.itls_ms) for r in records
+            if r.role == "victim" and r.itls_ms]
+    return round(statistics.mean(vals), 3) if vals else 0.0
 
 
 @dataclass
@@ -134,7 +146,7 @@ def build_cells(models, sweep: Sweep, arms=None) -> list[Cell]:
 async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
                    dry_run: bool, n_tasks: int, max_concurrency: int,
                    frontend_log: str | None = None,
-                   words_per_block: int = 32) -> Cell:
+                   words_per_block: int = 32, latency_model=None) -> Cell:
     cfg = WorkloadConfig(n_tasks=60 if dry_run else n_tasks, fanout_k=cell.fanout_k,
                          burst_multiplier=cell.burst,
                          shared_prefix_blocks=cell.prefix_blocks,
@@ -157,8 +169,14 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
     elif arm is Arm.A3:
         load_source = _make_load_source(model, dry_run)
         kwargs["load_source"] = load_source
-        kwargs["load_threshold"] = cell.param
         kwargs["drain_interval_ms"] = sweep.drain_ms[0]
+        if latency_model is not None:
+            # Budget rule: admit on projected T(S) <= SLO. The swept cell.param
+            # (tau) is ignored — the boundary comes from the model + SLO.
+            kwargs["latency_model"] = latency_model
+            kwargs["slo_ms"] = model.itl_slo_ms
+        else:
+            kwargs["load_threshold"] = cell.param   # legacy raw-threshold sweep
 
     eng = ReplayEngine(rows, arm, model.served_model_name, frontend, **kwargs)
     if arm is Arm.A3 and dry_run:
@@ -267,7 +285,8 @@ async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
                      limit: int | None = None, n_tasks: int = 120,
                      max_concurrency: int = 64,
                      frontend_log: str | None = None,
-                     words_per_block: int = 32, arms=None) -> list[Cell]:
+                     words_per_block: int = 32, arms=None,
+                     latency_model=None) -> list[Cell]:
     os.makedirs(outdir, exist_ok=True)
     cells = build_cells(models, sweep, arms)
     if limit:
@@ -277,12 +296,62 @@ async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
         model = next(m for m in models if m.label == cell.model)
         res = await run_cell(cell, model, sweep, outdir, dry_run,
                              n_tasks, max_concurrency, frontend_log,
-                             words_per_block)
+                             words_per_block, latency_model)
         done.append(res)
         print(f"[{i+1}/{len(cells)}] {res.name()}  goodput={res.goodput}  "
               f"victim_p95_itl={res.victim_p95_itl_ms}ms")
     _merge_manifest(outdir, done)
     return done
+
+
+async def run_calibration(model: ModelSpec, sweep: Sweep, outdir: str,
+                          dry_run: bool, n_tasks: int, frontend_log: str | None,
+                          words_per_block: int, levels: list[int]) -> dict:
+    """Sweep offered load (eager A1) across concurrency ``levels``; for each,
+    sample the live decode load and pair it with the victim ITL. Fit ITL(load)
+    and write ``calibration.json`` — the model + SLO-derived A3 admit boundary.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    load_source = _make_load_source(model, dry_run)
+    points = []
+    print(f"calibration: {model.label} @ SLO {model.itl_slo_ms} ms, "
+          f"levels={levels} ({'DRY RUN' if dry_run else 'LIVE'})")
+    for lvl in levels:
+        cfg = WorkloadConfig(n_tasks=40 if dry_run else n_tasks, fanout_k=5,
+                             burst_multiplier=8.0, shared_prefix_blocks=8,
+                             agent_policy_class="agents", victim_policy_class="latency")
+        rows = [json.loads(r.to_json()) for r in generate(cfg, sweep.base_seed + lvl)]
+        frontend = (MockFrontend(alpha=0.08) if dry_run
+                    else HttpFrontend(model.base_url, model.served_model_name, max_conns=lvl))
+        eng = ReplayEngine(rows, Arm.A1, model.served_model_name, frontend,
+                           clock_scale=0.02 if dry_run else 1.0, max_concurrency=lvl,
+                           words_per_block=words_per_block)
+        if dry_run and hasattr(load_source, "bind"):
+            load_source.bind(eng)
+        sampler = LoadSampler(load_source.num_decode_requests,
+                              interval_ms=50 if dry_run else 200)
+        sampler.start()
+        records = await eng.run()
+        await sampler.stop()
+        if hasattr(frontend, "close"):
+            await frontend.close()
+        if frontend_log and not dry_run and os.path.exists(frontend_log):
+            await asyncio.sleep(1.0)
+            apply_server_metrics(records, parse_frontend_metrics(frontend_log))
+        load, vitl = sampler.mean(), _victim_mean_itl(records)
+        points.append((load, vitl))
+        print(f"  conc={lvl:<4} decode_load={load:6.2f}  victim_ITL={vitl:7.2f} ms")
+
+    report = summarize_calibration(points, model.itl_slo_ms)
+    path = os.path.join(outdir, "calibration.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+    m = report["model"]
+    print(f"\nfit: ITL(load) = {m['t0_ms']:.2f} + {m['beta_ms_per_req']:.3f}·load  (n={m['n_points']})")
+    print(f"SLO {model.itl_slo_ms} ms  ->  A3 admit boundary tau* = {report['tau_star']:.2f} decode reqs")
+    print(f"unloaded floor {report['unloaded_itl_ms']} ms (SLO must exceed this to be feasible)")
+    print(f"wrote {path}  — pass it to the H2 run as --latency-model {path}")
+    return report
 
 
 def _cell_key(d: dict) -> tuple:
@@ -337,6 +406,20 @@ def main() -> None:
                    help="comma-separated arms to run (default all). Targets a "
                         "hypothesis without cell-offset math: H1 -> 'A0,A1', "
                         "H2 -> 'A0,A2,A3'. Combine with --reps; skip --limit.")
+    p.add_argument("--itl-slo-ms", type=float, default=None,
+                   help="override the ITL SLO budget for goodput AND the A3 budget "
+                        "rule. Set from calibration's unloaded floor + an interactive "
+                        "margin (defaults to each model's built-in itl_slo_ms).")
+    p.add_argument("--calibrate", action="store_true",
+                   help="calibration mode: sweep offered load, fit ITL(load), write "
+                        "calibration.json (the model A3's budget rule needs). Runs "
+                        "one model; use --calib-concurrency for the load levels.")
+    p.add_argument("--calib-concurrency", default="8,16,32,64,128",
+                   help="comma-separated concurrency levels for --calibrate.")
+    p.add_argument("--latency-model", default=None,
+                   help="path to a calibration.json. When set, A3 uses the budget "
+                        "rule (projected T(S) <= SLO) instead of the swept tau — the "
+                        "faithful TAPER admission rule.")
     p.add_argument("--models", default=None,
                    help="comma-separated model labels to run (default: all). "
                         "Use one label to run just the model currently deployed; "
@@ -359,6 +442,22 @@ def main() -> None:
                              f"available: {[m.label for m in MODELS]}")
     if a.base_url:
         models = [replace(m, base_url=a.base_url) for m in models]
+    if a.itl_slo_ms is not None:
+        models = [replace(m, itl_slo_ms=a.itl_slo_ms) for m in models]
+
+    # Calibration mode: one model, sweep load, fit ITL(load), write the model.
+    if a.calibrate:
+        if len(models) != 1:
+            raise SystemExit("--calibrate runs ONE model; pass --models <label>")
+        levels = [int(s) for s in a.calib_concurrency.split(",")]
+        asyncio.run(run_calibration(models[0], Sweep(), a.outdir, a.dry_run,
+                                    a.n_tasks, a.frontend_log, a.words_per_block, levels))
+        return
+
+    latency_model = None
+    if a.latency_model:
+        with open(a.latency_model) as f:
+            latency_model = LatencyModel.from_dict(json.load(f)["model"])
 
     arms = None
     if a.arms:
@@ -374,7 +473,7 @@ def main() -> None:
           f"({'DRY RUN' if a.dry_run else 'LIVE'})")
     asyncio.run(run_matrix(models, sweep, a.outdir, a.dry_run, a.limit,
                            a.n_tasks, a.max_concurrency, a.frontend_log,
-                           a.words_per_block, arms))
+                           a.words_per_block, arms, latency_model))
 
 
 if __name__ == "__main__":

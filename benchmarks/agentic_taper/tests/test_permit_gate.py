@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from permit_gate import GateRequest, PermitGate, Policy  # noqa: E402
+from latency_model import LatencyModel  # noqa: E402
 
 
 def _collector():
@@ -44,6 +45,56 @@ class TestProtectedGuarantee(unittest.TestCase):
         g.submit(_req("t", "root", protected=True))       # protected -> admitted
         self.assertEqual(sent, ["root"])
         self.assertEqual(g.total_held, 1)
+
+
+class TestFpmBudgetRule(unittest.TestCase):
+    # ITL(load) = 20 + 5*load  -> at SLO=50, projected itl_at(load+1) <= 50
+    # means 20 + 5*(load+1) <= 50 => load <= 5. So admit an opportunistic sibling
+    # while live load <= 5; hold at load 6+.
+    MODEL = LatencyModel(t0_ms=20.0, beta_ms_per_req=5.0)
+
+    def _gate(self, load_holder):
+        sent, send = _collector()
+        g = PermitGate(Policy.FPM, send, load_fn=lambda: load_holder[0],
+                       latency_model=self.MODEL, slo_ms=50.0)
+        return sent, g
+
+    def test_admits_under_budget(self):
+        load = [4]                         # itl_at(5)=45 <= 50 -> admit
+        sent, g = self._gate(load)
+        g.submit(_req("t", "sib", protected=False))
+        self.assertEqual(sent, ["sib"])
+
+    def test_holds_over_budget(self):
+        load = [6]                         # itl_at(7)=55 > 50 -> hold
+        sent, g = self._gate(load)
+        g.submit(_req("t", "sib", protected=False))
+        self.assertEqual(sent, [])
+        self.assertEqual(g.total_held, 1)
+
+    def test_protected_runs_even_over_budget(self):
+        load = [1000]
+        sent, g = self._gate(load)
+        g.submit(_req("t", "root", protected=True))
+        self.assertEqual(sent, ["root"])
+
+    def test_drain_releases_when_load_drops(self):
+        load = [6]
+        sent, g = self._gate(load)
+        g.submit(_req("t", "sib", protected=False))   # held
+        self.assertEqual(g.total_held, 1)
+        load[0] = 3                                    # slack returns
+        g.drain()
+        self.assertEqual(sent, ["sib"])
+
+    def test_boundary_derives_from_slo_not_a_free_param(self):
+        # threshold_for_slo(50) = f^-1(50)-1 = (50-20)/5 - 1 = 5
+        self.assertAlmostEqual(self.MODEL.threshold_for_slo(50.0), 5.0)
+
+    def test_requires_model_or_threshold(self):
+        _, send = _collector()
+        with self.assertRaises(ValueError):
+            PermitGate(Policy.FPM, send, load_fn=lambda: 0)  # neither given
 
 
 class TestStaticCap(unittest.TestCase):

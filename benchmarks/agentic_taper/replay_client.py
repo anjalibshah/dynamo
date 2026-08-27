@@ -215,11 +215,16 @@ class ReplayEngine:
     def __init__(self, rows: list[dict], arm: Arm, model: str, frontend, *,
                  k: Optional[int] = None, load_source=None, load_threshold=None,
                  drain_interval_ms: float = 50.0, words_per_block: int = 400,
-                 clock_scale: float = 1.0, max_concurrency: int = 64):
+                 clock_scale: float = 1.0, max_concurrency: int = 64,
+                 latency_model=None, slo_ms: Optional[float] = None):
         self.rows = rows
         self.arm = arm
         self.model = model
         self.frontend = frontend
+        # A3 budget rule: when set, the FPM gate admits on projected T(S) <= SLO
+        # instead of a raw load threshold. See permit_gate / latency_model.
+        self.latency_model = latency_model
+        self.slo_ms = slo_ms
         # Client-resource guard, distinct from the experiment gate: caps how many
         # HTTP streams the loop reads at once so it keeps pace with generation and
         # doesn't backpressure the server into a crawl. The gate still governs
@@ -257,8 +262,17 @@ class ReplayEngine:
                 raise ValueError("A2 requires k")
             return PermitGate(Policy.STATIC_CAP, send, k=self.k)
         if self.arm is Arm.A3:
-            if self.load_source is None or self.load_threshold is None:
-                raise ValueError("A3 requires load_source and load_threshold")
+            if self.load_source is None:
+                raise ValueError("A3 requires a load_source")
+            # Prefer the budget rule (calibrated latency model + SLO); fall back
+            # to the legacy raw threshold only if no model was supplied.
+            if self.latency_model is not None and self.slo_ms is not None:
+                return PermitGate(Policy.FPM, send,
+                                  load_fn=self.load_source.num_decode_requests,
+                                  latency_model=self.latency_model,
+                                  slo_ms=self.slo_ms)
+            if self.load_threshold is None:
+                raise ValueError("A3 requires latency_model+slo_ms or load_threshold")
             return PermitGate(Policy.FPM, send,
                               load_fn=self.load_source.num_decode_requests,
                               load_threshold=self.load_threshold)
