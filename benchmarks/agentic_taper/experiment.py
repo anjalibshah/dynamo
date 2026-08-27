@@ -35,6 +35,7 @@ import os
 from dataclasses import asdict, dataclass, field, replace
 
 from replay_client import (Arm, HttpFrontend, MockFrontend, ReplayEngine,
+                           apply_server_metrics, parse_frontend_metrics,
                            task_goodput, victim_tail, write_results)
 from trace_gen import WorkloadConfig, generate
 
@@ -110,10 +111,14 @@ def _arm_params(arm: Arm, sw: Sweep):
     return [0]  # A0/A1 have no swept gate parameter
 
 
-def build_cells(models, sweep: Sweep) -> list[Cell]:
+def build_cells(models, sweep: Sweep, arms=None) -> list[Cell]:
+    # arms: optional iterable of Arm to include (default all). Lets a run target
+    # just the arms a hypothesis needs (H1 -> A0,A1; H2 -> A0,A2,A3) without doing
+    # cell-offset math against --limit.
+    selected = tuple(arms) if arms else (Arm.A0, Arm.A1, Arm.A2, Arm.A3)
     cells = []
     for m in models:
-        for arm in (Arm.A0, Arm.A1, Arm.A2, Arm.A3):
+        for arm in selected:
             for k, burst, pf, param, rep in itertools.product(
                     sweep.fanout_k, sweep.burst, sweep.prefix_blocks,
                     _arm_params(arm, sweep), range(sweep.reps)):
@@ -127,8 +132,10 @@ def build_cells(models, sweep: Sweep) -> list[Cell]:
 
 
 async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
-                   dry_run: bool) -> Cell:
-    cfg = WorkloadConfig(n_tasks=60 if dry_run else 200, fanout_k=cell.fanout_k,
+                   dry_run: bool, n_tasks: int, max_concurrency: int,
+                   frontend_log: str | None = None,
+                   words_per_block: int = 32) -> Cell:
+    cfg = WorkloadConfig(n_tasks=60 if dry_run else n_tasks, fanout_k=cell.fanout_k,
                          burst_multiplier=cell.burst,
                          shared_prefix_blocks=cell.prefix_blocks,
                          agent_policy_class="agents", victim_policy_class="latency")
@@ -136,11 +143,14 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
 
     arm = Arm(cell.arm)
     frontend = (MockFrontend(alpha=0.08) if dry_run
-                else HttpFrontend(model.base_url, model.served_model_name))
+                else HttpFrontend(model.base_url, model.served_model_name,
+                                  max_conns=max_concurrency))
 
     # Real runs keep true arrival timing; dry-runs compress it so the whole
     # matrix executes offline in seconds.
-    kwargs = {"clock_scale": 0.02 if dry_run else 1.0}
+    kwargs = {"clock_scale": 0.02 if dry_run else 1.0,
+              "max_concurrency": max_concurrency,
+              "words_per_block": words_per_block}
     load_source = None
     if arm is Arm.A2:
         kwargs["k"] = int(cell.param)
@@ -158,6 +168,27 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
     records = await eng.run()
     if hasattr(frontend, "close"):
         await frontend.close()
+
+    # Prefer server-measured ITL/TTFT over client SSE timing (see replay_client).
+    # The client loop can't time tokens accurately under co-batch load; the
+    # frontend metrics log is server truth. Give the log a moment to flush first.
+    # Fail LOUDLY if --frontend-log was requested but unusable — silently falling
+    # back to client timing produces plausible-but-wrong numbers (a whole run's
+    # worth), which is exactly the trap that wasted runs during bring-up.
+    if frontend_log and not dry_run:
+        if not os.path.exists(frontend_log):
+            raise SystemExit(
+                f"--frontend-log {frontend_log} does not exist. Launch the frontend "
+                f"redirected to it: `python3 -m dynamo.frontend … > {frontend_log} 2>&1 &` "
+                f"(same container as this run — /tmp is not shared across containers).")
+        await asyncio.sleep(1.0)
+        matched = apply_server_metrics(records, parse_frontend_metrics(frontend_log))
+        print(f"    server-metrics matched {matched}/{len(records)} requests")
+        if matched == 0:
+            raise SystemExit(
+                f"--frontend-log matched 0/{len(records)} requests — the log exists but "
+                f"nothing joined (wrong frontend? stale log? format change?). Refusing to "
+                f"report client-timed ITL. Check `grep 'request completed' {frontend_log}`.")
 
     write_results(records, os.path.join(outdir, cell.name() + ".jsonl"))
     cell.n_requests = len(records)
@@ -233,15 +264,20 @@ def _acquire_fpm_endpoint(model: ModelSpec):
 
 
 async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
-                     limit: int | None = None) -> list[Cell]:
+                     limit: int | None = None, n_tasks: int = 120,
+                     max_concurrency: int = 64,
+                     frontend_log: str | None = None,
+                     words_per_block: int = 32, arms=None) -> list[Cell]:
     os.makedirs(outdir, exist_ok=True)
-    cells = build_cells(models, sweep)
+    cells = build_cells(models, sweep, arms)
     if limit:
         cells = cells[:limit]
     done = []
     for i, cell in enumerate(cells):
         model = next(m for m in models if m.label == cell.model)
-        res = await run_cell(cell, model, sweep, outdir, dry_run)
+        res = await run_cell(cell, model, sweep, outdir, dry_run,
+                             n_tasks, max_concurrency, frontend_log,
+                             words_per_block)
         done.append(res)
         print(f"[{i+1}/{len(cells)}] {res.name()}  goodput={res.goodput}  "
               f"victim_p95_itl={res.victim_p95_itl_ms}ms")
@@ -279,6 +315,28 @@ def main() -> None:
                    help="MockFrontend, no GPU — validate matrix wiring offline.")
     p.add_argument("--limit", type=int, default=None, help="run only first N cells")
     p.add_argument("--reps", type=int, default=None)
+    p.add_argument("--n-tasks", type=int, default=120,
+                   help="tasks per live cell (default 120; was 200 — lower keeps "
+                        "the client loop paced with generation). Ignored in --dry-run.")
+    p.add_argument("--max-concurrency", type=int, default=64,
+                   help="cap on concurrent HTTP streams read by the client, and the "
+                        "aiohttp connection-pool limit. Prevents event-loop "
+                        "saturation that otherwise inflates measured ITL.")
+    p.add_argument("--frontend-log", default=None,
+                   help="path to the dynamo.frontend log (run it with "
+                        "`> /tmp/frontend.log 2>&1`). When set, per-request ITL/TTFT "
+                        "are read from the server's metrics lines instead of client "
+                        "SSE timing — the correct measurement under load.")
+    p.add_argument("--words-per-block", type=int, default=32,
+                   help="synthetic words per KV block in the prompt (default 32). "
+                        "Each word tokenizes to ~4 tokens, so 32 ≈ 128 tokens/block "
+                        "— enough to fill KV blocks for co-location without the "
+                        "16k-token prompts (words_per_block=400) that overloaded the "
+                        "server. Tune live; no re-scp needed.")
+    p.add_argument("--arms", default=None,
+                   help="comma-separated arms to run (default all). Targets a "
+                        "hypothesis without cell-offset math: H1 -> 'A0,A1', "
+                        "H2 -> 'A0,A2,A3'. Combine with --reps; skip --limit.")
     p.add_argument("--models", default=None,
                    help="comma-separated model labels to run (default: all). "
                         "Use one label to run just the model currently deployed; "
@@ -302,10 +360,21 @@ def main() -> None:
     if a.base_url:
         models = [replace(m, base_url=a.base_url) for m in models]
 
-    cells = build_cells(models, sweep)
-    print(f"matrix: {len(models)} model(s) x 4 arms x sweep = {len(cells)} cells "
+    arms = None
+    if a.arms:
+        want = [s.strip() for s in a.arms.split(",")]
+        try:
+            arms = [Arm(s) for s in want]
+        except ValueError:
+            raise SystemExit(f"unknown arm(s) in {want}; valid: A0,A1,A2,A3")
+
+    cells = build_cells(models, sweep, arms)
+    armstr = ",".join(x.value for x in arms) if arms else "A0,A1,A2,A3"
+    print(f"matrix: {len(models)} model(s) x [{armstr}] x sweep = {len(cells)} cells "
           f"({'DRY RUN' if a.dry_run else 'LIVE'})")
-    asyncio.run(run_matrix(models, sweep, a.outdir, a.dry_run, a.limit))
+    asyncio.run(run_matrix(models, sweep, a.outdir, a.dry_run, a.limit,
+                           a.n_tasks, a.max_concurrency, a.frontend_log,
+                           a.words_per_block, arms))
 
 
 if __name__ == "__main__":
