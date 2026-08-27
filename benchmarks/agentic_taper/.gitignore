@@ -1,0 +1,5 @@
+
+# local experiment outputs (data, not code)
+results*/
+deimos_results/
+deimos_logs_tmp/

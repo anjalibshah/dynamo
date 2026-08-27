@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import re
 import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -60,6 +61,7 @@ class Timing:
     itls_ms: list = field(default_factory=list)
     ok: bool = True
     error: str = ""      # populated when ok is False, so failures aren't silent
+    server_request_id: str = ""   # completion `id` (cmpl-…), joins to frontend metrics log
 
     @property
     def gate_wait_ms(self) -> float:
@@ -125,19 +127,30 @@ class HttpFrontend:
     needs_prompt = True
 
     def __init__(self, base_url: str, model: str, path: str = "/v1/completions",
-                 timeout_s: float = 120.0):
+                 timeout_s: float = 120.0, max_conns: int = 64):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.path = path
         self.timeout_s = timeout_s
+        # Bound the connection pool to match the engine's concurrency cap. Without
+        # this the client opens a socket per in-flight request; at 100+ concurrent
+        # streams the single event loop can't drain the sockets at line rate, so
+        # the server's tokens sit flow-controlled in TCP buffers and the *observed*
+        # first-token→done span (hence measured ITL) reflects client read-slowness,
+        # not decode. Capping connections keeps reads paced with generation.
+        self.max_conns = max_conns
         self._session = None
 
     async def _ensure_session(self):
         if self._session is None:
             import aiohttp
             # Session-level timeout as a ClientTimeout (aiohttp rejects a bare
-            # float on the request call).
+            # float on the request call). Connector limit matches max_conns so the
+            # pool never outgrows what one event loop can service promptly.
+            connector = aiohttp.TCPConnector(limit=self.max_conns,
+                                             limit_per_host=self.max_conns)
             self._session = aiohttp.ClientSession(
+                connector=connector,
                 timeout=aiohttp.ClientTimeout(total=self.timeout_s))
         return self._session
 
@@ -160,6 +173,17 @@ class HttpFrontend:
                     if record.t_first_token == 0.0:
                         record.t_first_token = now
                         record.ttft_ms = (now - record.t_admit) * 1000.0
+                        # Capture the server-assigned completion id once. Under
+                        # load the client-side per-token timing is unreliable (the
+                        # loop can't drain 60+ SSE streams at line rate); the true
+                        # ITL is read from the frontend metrics log post-run, joined
+                        # on this id. Client itls are kept only as a fallback.
+                        try:
+                            cid = json.loads(data).get("id", "")
+                            record.server_request_id = (
+                                cid[len("cmpl-"):] if cid.startswith("cmpl-") else cid)
+                        except Exception:
+                            pass
                     elif last is not None:
                         record.itls_ms.append((now - last) * 1000.0)
                     last = now
@@ -191,11 +215,17 @@ class ReplayEngine:
     def __init__(self, rows: list[dict], arm: Arm, model: str, frontend, *,
                  k: Optional[int] = None, load_source=None, load_threshold=None,
                  drain_interval_ms: float = 50.0, words_per_block: int = 400,
-                 clock_scale: float = 1.0):
+                 clock_scale: float = 1.0, max_concurrency: int = 64):
         self.rows = rows
         self.arm = arm
         self.model = model
         self.frontend = frontend
+        # Client-resource guard, distinct from the experiment gate: caps how many
+        # HTTP streams the loop reads at once so it keeps pace with generation and
+        # doesn't backpressure the server into a crawl. The gate still governs
+        # experiment admission (A0/A2/A3 caps); this only bounds concurrent reads.
+        self.max_concurrency = max_concurrency
+        self._sema: Optional[asyncio.Semaphore] = None
         if hasattr(frontend, "engine"):
             frontend.engine = self
         self.k = k
@@ -254,9 +284,12 @@ class ReplayEngine:
         prompt = (synth_prompt(row["hash_ids"], self.words_per_block)
                   if getattr(self.frontend, "needs_prompt", True) else "")
         try:
-            await self.frontend.complete(
-                prompt=prompt, max_tokens=row["output_length"],
-                headers=self._headers(row), record=rec, loop=self._loop)
+            # Bound concurrent reads. ITL timing only starts at first token, so
+            # time spent waiting here never counts toward ITL/TTFT.
+            async with self._sema:
+                await self.frontend.complete(
+                    prompt=prompt, max_tokens=row["output_length"],
+                    headers=self._headers(row), record=rec, loop=self._loop)
         finally:
             self.inflight -= 1
             self._gate.on_complete(row["task_id"])
@@ -295,6 +328,7 @@ class ReplayEngine:
     async def run(self) -> list[Timing]:
         self._loop = asyncio.get_event_loop()
         self._gate = self._make_gate()
+        self._sema = asyncio.Semaphore(self.max_concurrency)
         self._all_done = asyncio.Event()
         self._pending = len(self.rows)
         for r in self.rows:
@@ -312,6 +346,68 @@ class ReplayEngine:
             drain.cancel()
             await drain
         return list(self.records.values())
+
+
+# --------------------------------------------------------------------------- #
+# Server-side latency (read from the frontend metrics log, not client SSE timing)
+# --------------------------------------------------------------------------- #
+
+# The frontend logs one line per finished request, e.g.:
+#   ... metrics: request completed request_id=<uuidA> ... request_id=<uuidB> ...
+#       output_tokens=48 ttft_ms="53.16" avg_itl_ms="2.24" ...
+# A completed line carries TWO request_ids (the completion id and the http request
+# id) and their order is not stable across code paths, so we key the metrics under
+# EVERY request_id on the line. The client captured one of them into
+# Timing.server_request_id (from the SSE completion `id`); whichever it is will hit.
+# This is server-measured decode latency, immune to client event-loop contention.
+# The frontend colorizes its logs even when redirected to a file, so keys/values
+# are wrapped in ANSI escapes (e.g. "\x1b[3mrequest_id\x1b[0m\x1b[2m=\x1b[0m<uuid>").
+# Strip them before matching. (Launching the frontend with NO_COLOR=1 also avoids
+# this, but stripping here makes the parser robust either way.)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_RID_RE = re.compile(r'request_id=([0-9a-fA-F][0-9a-fA-F-]{7,})')
+_OUT_RE = re.compile(r'output_tokens=(\d+)')
+_TTFT_RE = re.compile(r'ttft_ms="([0-9.]+)"')
+_ITL_RE = re.compile(r'avg_itl_ms="([0-9.]+)"')
+
+
+def parse_frontend_metrics(log_path: str) -> dict:
+    """Map every server request_id -> {avg_itl_ms, ttft_ms, output_tokens}."""
+    out: dict = {}
+    with open(log_path, "r", errors="ignore") as f:
+        for line in f:
+            if "request completed" not in line:
+                continue
+            line = _ANSI_RE.sub("", line)
+            mi, mt, mo = _ITL_RE.search(line), _TTFT_RE.search(line), _OUT_RE.search(line)
+            if not (mi and mt and mo):
+                continue  # no per-token ITL (e.g. single-token output) — skip
+            metrics = {"avg_itl_ms": float(mi.group(1)),
+                       "ttft_ms": float(mt.group(1)),
+                       "output_tokens": int(mo.group(1))}
+            for rid in _RID_RE.findall(line):
+                out[rid] = metrics
+    return out
+
+
+def apply_server_metrics(records: list[Timing], metrics: dict) -> int:
+    """Overwrite each record's ttft/itls with server-measured values where matched.
+
+    Sets ``itls_ms`` to a flat array whose mean equals the server ``avg_itl_ms`` and
+    whose length is ``output_tokens-1`` — so downstream code (which takes the
+    per-request mean and counts tokens) is unchanged, but the number is server truth.
+    Returns the count matched; unmatched records keep their client-side values.
+    """
+    n = 0
+    for r in records:
+        d = metrics.get(r.server_request_id)
+        if not d:
+            continue
+        r.ttft_ms = d["ttft_ms"]
+        ntok = max(1, d["output_tokens"])
+        r.itls_ms = [d["avg_itl_ms"]] * max(1, ntok - 1)
+        n += 1
+    return n
 
 
 # --------------------------------------------------------------------------- #

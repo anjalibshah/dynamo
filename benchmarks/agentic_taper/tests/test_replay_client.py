@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from load_source import MockLoadSource  # noqa: E402
 from replay_client import (Arm, MockFrontend, ReplayEngine, HEADER_PARENT,  # noqa: E402
-                           HEADER_SESSION, task_goodput, victim_tail)
+                           HEADER_SESSION, Timing, apply_server_metrics,
+                           parse_frontend_metrics, task_goodput, victim_tail)
 from trace_gen import WorkloadConfig, generate  # noqa: E402
 
 
@@ -131,6 +132,52 @@ class TestLoadTrend(unittest.TestCase):
         g = task_goodput(recs, itl_slo_ms=10_000)  # loose SLO => most pass
         self.assertGreaterEqual(g, 0.0)
         self.assertLessEqual(g, 1.0)
+
+
+class ServerMetricsTest(unittest.TestCase):
+    # Real lines carry TWO request_ids; the completion id may be either one.
+    LOG = (
+        'ts INFO metrics: request received request_id=91690883-aaaa endpoint=completions\n'
+        'ts INFO metrics: request completed request_id=91690883-aaaa-4a56-8d00-7521a0ee960d '
+        'model=m endpoint=completions status=success elapsed_ms=158 method=POST '
+        'uri=/v1/completions request_id=4287a54d-bbbb-41db-92c2-13db4968d449 '
+        'input_tokens=11 output_tokens=48 image_count=0 ttft_ms="53.16" '
+        'avg_itl_ms="2.24" decode_worker_id=7\n'
+        'ts INFO metrics: request completed request_id=3333-4444-single '
+        'output_tokens=1 ttft_ms="40.0"\n'  # single token: no avg_itl_ms -> skipped
+    )
+
+    def test_parse_frontend_metrics_keys_every_request_id(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write(self.LOG)
+            path = f.name
+        m = parse_frontend_metrics(path)
+        os.unlink(path)
+        # both request_ids on the completed line map to the same metrics
+        self.assertIn("91690883-aaaa-4a56-8d00-7521a0ee960d", m)
+        self.assertIn("4287a54d-bbbb-41db-92c2-13db4968d449", m)
+        self.assertAlmostEqual(m["4287a54d-bbbb-41db-92c2-13db4968d449"]["avg_itl_ms"], 2.24)
+        self.assertEqual(m["91690883-aaaa-4a56-8d00-7521a0ee960d"]["output_tokens"], 48)
+        # single-token line (no avg_itl_ms) is skipped
+        self.assertNotIn("3333-4444-single", m)
+
+    def test_apply_server_metrics_overwrites_matched_only(self):
+        matched = Timing(request_id="r1", task_id="t", role="victim", arm="A0",
+                         model="m", server_request_id="1111-2222",
+                         itls_ms=[999.0, 999.0], ttft_ms=5000.0)
+        unmatched = Timing(request_id="r2", task_id="t", role="victim", arm="A0",
+                           model="m", server_request_id="nope", itls_ms=[42.0])
+        metrics = {"1111-2222": {"avg_itl_ms": 2.24, "ttft_ms": 53.16,
+                                 "output_tokens": 48}}
+        n = apply_server_metrics([matched, unmatched], metrics)
+        self.assertEqual(n, 1)
+        # matched: mean(itls) == server avg_itl, ttft replaced, token count preserved
+        self.assertAlmostEqual(statistics.mean(matched.itls_ms), 2.24)
+        self.assertEqual(len(matched.itls_ms), 47)   # output_tokens-1
+        self.assertAlmostEqual(matched.ttft_ms, 53.16)
+        # unmatched untouched
+        self.assertEqual(unmatched.itls_ms, [42.0])
 
 
 if __name__ == "__main__":

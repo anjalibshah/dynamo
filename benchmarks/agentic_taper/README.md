@@ -10,7 +10,7 @@ measures whether agentic fan-out imposes a disproportionate externality on
 co-batched interactive work (H1), and whether a task-aware permit gate built
 only from signals Dynamo already emits recovers goodput and tail latency (H2).
 
-No Dynamo code changes. The four arms run against **stock** Dynamo + SGLang; the
+No Dynamo code changes. The four arms run against **stock** Dynamo + vLLM; the
 gate lives here in the replay client, because Dynamo's router owns queueing and
 its release condition is not steerable by a live signal (brief §1, Appendix C).
 
