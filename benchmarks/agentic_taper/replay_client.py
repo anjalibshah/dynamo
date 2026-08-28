@@ -9,12 +9,14 @@ dependencies, stamps task lineage headers, routes every request through the
 permit gate (the arm decides the gate's policy), dispatches to an
 OpenAI-compatible endpoint, and records per-request client-side latency.
 
-Arm → gate policy (one trace, one gate, one variable changes):
+Arm → (trace, gate). A0 and A1 share the eager gate and differ only in the
+trace's sibling placement, so A0 vs A1 isolates routing concentration at matched
+load (needs >=2 workers + KV-aware routing). A2/A3 gate the concentrated trace:
 
-    A0  STATIC_CAP k=1     one request per task at a time (clean baseline)
-    A1  EAGER              admit everything as soon as deps clear
-    A2  STATIC_CAP k=K     fixed per-task cap
-    A3  FPM  threshold=tau task-aware gate on live FPM load
+    A0  distributed trace, EAGER   fan-out spread across workers (no hot spot)
+    A1  concentrated trace, EAGER  fan-out concentrated on the victim's worker
+    A2  concentrated trace, STATIC_CAP k=K   fixed per-task cap
+    A3  concentrated trace, FPM budget rule   admit while projected T(S) <= SLO
 
 The frontend is pluggable: ``HttpFrontend`` for a real Dynamo+SGLang endpoint
 (validated on the box) and ``MockFrontend`` — load-dependent, deterministic —
@@ -62,6 +64,7 @@ class Timing:
     ok: bool = True
     error: str = ""      # populated when ok is False, so failures aren't silent
     server_request_id: str = ""   # completion `id` (cmpl-…), joins to frontend metrics log
+    server_worker_id: str = ""    # decode_worker_id — for the concentration precondition
 
     @property
     def gate_wait_ms(self) -> float:
@@ -253,10 +256,11 @@ class ReplayEngine:
 
     def _make_gate(self) -> PermitGate:
         send = self._on_admit
-        if self.arm is Arm.A1:
+        if self.arm in (Arm.A0, Arm.A1):
+            # Both eager. A0 (distributed baseline) and A1 (concentrated) differ
+            # ONLY in the trace's sibling placement (distribute_siblings), so A0
+            # vs A1 isolates routing concentration at identical dispatch.
             return PermitGate(Policy.EAGER, send)
-        if self.arm is Arm.A0:
-            return PermitGate(Policy.STATIC_CAP, send, k=1)
         if self.arm is Arm.A2:
             if not self.k:
                 raise ValueError("A2 requires k")
@@ -383,10 +387,11 @@ _RID_RE = re.compile(r'request_id=([0-9a-fA-F][0-9a-fA-F-]{7,})')
 _OUT_RE = re.compile(r'output_tokens=(\d+)')
 _TTFT_RE = re.compile(r'ttft_ms="([0-9.]+)"')
 _ITL_RE = re.compile(r'avg_itl_ms="([0-9.]+)"')
+_WORKER_RE = re.compile(r'decode_worker_id=(\d+)')
 
 
 def parse_frontend_metrics(log_path: str) -> dict:
-    """Map every server request_id -> {avg_itl_ms, ttft_ms, output_tokens}."""
+    """Map every server request_id -> {avg_itl_ms, ttft_ms, output_tokens, worker_id}."""
     out: dict = {}
     with open(log_path, "r", errors="ignore") as f:
         for line in f:
@@ -396,9 +401,11 @@ def parse_frontend_metrics(log_path: str) -> dict:
             mi, mt, mo = _ITL_RE.search(line), _TTFT_RE.search(line), _OUT_RE.search(line)
             if not (mi and mt and mo):
                 continue  # no per-token ITL (e.g. single-token output) — skip
+            mw = _WORKER_RE.search(line)
             metrics = {"avg_itl_ms": float(mi.group(1)),
                        "ttft_ms": float(mt.group(1)),
-                       "output_tokens": int(mo.group(1))}
+                       "output_tokens": int(mo.group(1)),
+                       "worker_id": mw.group(1) if mw else ""}
             for rid in _RID_RE.findall(line):
                 out[rid] = metrics
     return out
@@ -420,8 +427,29 @@ def apply_server_metrics(records: list[Timing], metrics: dict) -> int:
         r.ttft_ms = d["ttft_ms"]
         ntok = max(1, d["output_tokens"])
         r.itls_ms = [d["avg_itl_ms"]] * max(1, ntok - 1)
+        r.server_worker_id = d.get("worker_id", "")
         n += 1
     return n
+
+
+def concentration_report(records: list[Timing]) -> dict:
+    """Precondition check (README Appendix E): are an aggressor task's fan-out
+    branches CONCENTRATED on one worker (A1) or SPREAD (A0)?
+
+    Returns the mean number of distinct decode workers a task's branches landed
+    on. ~1 means concentrated; ~fanout_k means spread. If A1 is not ~1 the
+    KV-aware routing / multi-worker deploy is wrong and the experiment is void.
+    """
+    by_task: dict[str, set] = {}
+    for r in records:
+        if r.role == "branch" and r.server_worker_id:
+            by_task.setdefault(r.task_id, set()).add(r.server_worker_id)
+    if not by_task:
+        return {"tasks": 0, "mean_distinct_workers": 0.0}
+    spreads = [len(w) for w in by_task.values()]
+    return {"tasks": len(spreads),
+            "mean_distinct_workers": round(sum(spreads) / len(spreads), 3),
+            "max_distinct_workers": max(spreads)}
 
 
 # --------------------------------------------------------------------------- #

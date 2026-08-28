@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from load_source import MockLoadSource  # noqa: E402
 from replay_client import (Arm, MockFrontend, ReplayEngine, HEADER_PARENT,  # noqa: E402
                            HEADER_SESSION, Timing, apply_server_metrics,
-                           parse_frontend_metrics, task_goodput, victim_tail)
+                           concentration_report, parse_frontend_metrics,
+                           task_goodput, victim_tail)
 from trace_gen import WorkloadConfig, generate  # noqa: E402
 
 
@@ -108,22 +109,32 @@ class TestStaticCapHolds(unittest.TestCase):
 
 
 class TestLoadTrend(unittest.TestCase):
-    def test_eager_not_better_than_serialized_for_victim(self):
-        # With a load-dependent engine, eager fan-out (A1) should not give a
-        # *lower* victim mean ITL than the serialized baseline (A0).
-        rows = _trace(n_tasks=50, k=8, burst=8.0)
+    def test_a0_a1_identical_under_mock_concentration_needs_real_engine(self):
+        # A0 (distributed) and A1 (concentrated) now differ ONLY in hash-id
+        # placement, which drives *routing* on a real multi-worker engine. The
+        # MockFrontend has no routing (ITL depends only on inflight), so it cannot
+        # see concentration — A0 and A1 must give identical victim ITLs here.
+        # The real externality requires >=2 workers + KV-aware routing on the box;
+        # a mock A0-vs-A1 difference would be a bug.
+        import json as _json
 
-        fe0 = MockFrontend(alpha=0.1)
-        recs0 = _run(ReplayEngine(rows, Arm.A0, "m", fe0))
-        fe1 = MockFrontend(alpha=0.1)
-        recs1 = _run(ReplayEngine(rows, Arm.A1, "m", fe1))
+        from trace_gen import WorkloadConfig, generate
+
+        def rows(distribute):
+            cfg = WorkloadConfig(n_tasks=50, fanout_k=8, burst_multiplier=8.0,
+                                 shared_prefix_blocks=2, branch_unique_blocks=1,
+                                 distribute_siblings=distribute)
+            return [_json.loads(r.to_json()) for r in generate(cfg, seed=11)]
+
+        r0 = _run(ReplayEngine(rows(True), Arm.A0, "m", MockFrontend(alpha=0.1)))
+        r1 = _run(ReplayEngine(rows(False), Arm.A1, "m", MockFrontend(alpha=0.1)))
 
         def vmean(recs):
             vals = [statistics.mean(r.itls_ms) for r in recs
                     if r.role == "victim" and r.itls_ms]
             return statistics.mean(vals) if vals else 0.0
 
-        self.assertLessEqual(vmean(recs0), vmean(recs1) + 1e-6)
+        self.assertAlmostEqual(vmean(r0), vmean(r1), places=3)
 
     def test_metrics_helpers_run(self):
         rows = _trace(n_tasks=10)
@@ -178,6 +189,25 @@ class ServerMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(matched.ttft_ms, 53.16)
         # unmatched untouched
         self.assertEqual(unmatched.itls_ms, [42.0])
+
+    def _branch(self, task, worker):
+        return Timing(request_id=f"{task}-b", task_id=task, role="branch",
+                      arm="A1", model="m", server_worker_id=worker)
+
+    def test_concentration_report_concentrated_vs_spread(self):
+        # concentrated: both branches of each task on the same worker -> 1.0
+        conc = [self._branch("t1", "W1"), self._branch("t1", "W1"),
+                self._branch("t2", "W2"), self._branch("t2", "W2")]
+        self.assertEqual(concentration_report(conc)["mean_distinct_workers"], 1.0)
+        # spread: each task's branches on distinct workers -> 2.0
+        spread = [self._branch("t1", "W1"), self._branch("t1", "W2"),
+                  self._branch("t2", "W3"), self._branch("t2", "W4")]
+        self.assertEqual(concentration_report(spread)["mean_distinct_workers"], 2.0)
+
+    def test_concentration_report_ignores_non_branch_and_empty(self):
+        recs = [Timing(request_id="v", task_id="t", role="victim", arm="A1",
+                       model="m", server_worker_id="W1")]
+        self.assertEqual(concentration_report(recs)["tasks"], 0)
 
 
 if __name__ == "__main__":

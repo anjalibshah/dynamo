@@ -18,10 +18,19 @@ its release condition is not steerable by a live signal (brief §1, Appendix C).
 
 | Arm | Behavior | Where it's set |
 |-----|----------|----------------|
-| A0 | Fan-out suppressed — one request per task at a time | trace generator |
-| A1 | Eager fan-out (today's default) | trace generator |
-| A2 | Fixed per-task cap `K` | `PermitGate(STATIC_CAP, k=K)` |
-| A3 | Task-aware gate on live FPM load | `PermitGate(FPM, load_threshold=τ)` |
+| A0 | **Distributed** baseline — fan-out **spread** across workers (unique prefixes), eager | trace generator (`distribute_siblings=True`) |
+| A1 | **Concentrated** — fan-out on one worker (shared prefix), eager | trace generator |
+| A2 | Concentrated + fixed per-task cap `K` | `PermitGate(STATIC_CAP, k=K)` |
+| A3 | Concentrated + budget rule on FPM load | `PermitGate(FPM, latency_model, slo_ms)` |
+
+> **Baseline redesign (Aug 2026):** the original A0 (`STATIC_CAP k=1`, "serialize
+> the fan-out") confounded the co-location externality with throughput — on a
+> single worker it made A1 look better purely because parallel finishes faster.
+> A0 is now the **distributed** counterfactual: same fan-out load, same eager
+> dispatch, but siblings get unique prefixes so KV-aware routing spreads them
+> across workers instead of concentrating them. **A0 vs A1 isolates concentration
+> at matched load.** Requires ≥2 workers + KV-aware routing (else A0≡A1 — a
+> red-flag the deploy is wrong; the concentration check asserts this).
 
 A2 and A3 are the **same** gate with different admit predicates, so an A3 win is
 attributable to adaptivity, not to a different code path.
@@ -73,10 +82,10 @@ reports the A1 throughput-trap curve, paired same-seed charged externality
 ### Arms map onto one gate (one variable changes)
 | Arm | Gate config |
 |-----|-------------|
-| A0 | `STATIC_CAP, k=1` — one request per task at a time (baseline) |
-| A1 | `EAGER` — admit as soon as DAG deps clear |
-| A2 | `STATIC_CAP, k=K` — fixed per-task cap |
-| A3 | `FPM, load_threshold=τ` — task-aware on live `num_decode_requests` |
+| A0 | distributed trace, `EAGER` — fan-out spread across workers (baseline) |
+| A1 | concentrated trace, `EAGER` — fan-out on one worker |
+| A2 | concentrated trace, `STATIC_CAP, k=K` — fixed per-task cap |
+| A3 | concentrated trace, `FPM` budget rule — admit while projected T(S) ≤ SLO |
 
 ### Two models
 `experiment.py`'s `MODELS` list runs the whole matrix per model. **Confirm
@@ -113,11 +122,13 @@ Row schema matches `AgenticMooncakeRow` (`lib/data-gen/src/mooncake.rs`): shared
 
 ## Arm → trace/gate mapping
 
-* **A0**: generate with `--fanout-k 0` (or run only roots), so each task is one request.
-* **A1**: generate with fan-out; replay client sends every request as soon as its
-  DAG dependencies clear. No gate.
-* **A2**: A1 trace; wrap dispatch in `PermitGate(Policy.STATIC_CAP, k=K)`.
-* **A3**: A1 trace; wrap dispatch in `PermitGate(Policy.FPM, load_fn=fpm.num_decode_requests, load_threshold=τ)`.
+* **A0**: generate with `distribute_siblings=True` (unique per-branch prefixes) so
+  routing spreads the fan-out; eager dispatch, no gate. The distributed baseline.
+* **A1**: generate concentrated (shared prefix); eager dispatch, no gate. Only the
+  hash-id placement differs from A0 — matched load.
+* **A2**: A1 (concentrated) trace; wrap dispatch in `PermitGate(Policy.STATIC_CAP, k=K)`.
+* **A3**: A1 (concentrated) trace; wrap dispatch in `PermitGate(Policy.FPM, latency_model, slo_ms)`
+  (budget rule: admit while projected `T(S) ≤ SLO`; `--latency-model` from calibration).
 
 ## Interfaces for the GPU-side components
 
@@ -162,10 +173,18 @@ rules (§ below).
 
 ## Pre-registered decision rules (write the thresholds before running)
 
-* **H1a (primary)** confirmed if A1's goodput-vs-load curve has a knee — goodput
+> **Revised (Aug 2026):** with the distributed-vs-concentrated A0/A1 redesign, the
+> **primary H1 metric is the paired A1−A0 victim latency (TTFT + ITL + total)** at
+> matched load — does concentrating the fan-out demonstrably raise the victim's
+> latency vs. spreading it? Use `victim`-request metrics (NOT `task_goodput`, which
+> mixes in agent tasks and misled an early read), with a paired CI excluding zero.
+> The goodput "knee" below is a *secondary* signal and only appears in an
+> unsaturated load sweep — do not treat its absence as falsification on its own.
+
+* **H1a (secondary)** supported if A1's goodput-vs-load curve has a knee — goodput
   turns down while throughput keeps rising — and A0 shows none in range.
-* **H1 falsified** if goodput tracks throughput monotonically (no knee) *or*
-  victim tail latency is paired-flat between A0 and A1 → report the negative, stop.
+* **H1 falsified** if the paired A1−A0 victim latency CI includes zero (concentrating
+  fan-out doesn't hurt the victim) → report the negative, stop.
 * **H2** confirmed if A3 beats best-K A2 on goodput with a paired CI excluding
   zero, at ≥ comparable throughput.
 * **H2 falsified** if A3 ≤ best-K A2 → the value isn't in dynamic gating; report, stop.
