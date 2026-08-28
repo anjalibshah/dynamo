@@ -109,32 +109,39 @@ class TestStaticCapHolds(unittest.TestCase):
 
 
 class TestLoadTrend(unittest.TestCase):
-    def test_a0_a1_identical_under_mock_concentration_needs_real_engine(self):
-        # A0 (distributed) and A1 (concentrated) now differ ONLY in hash-id
-        # placement, which drives *routing* on a real multi-worker engine. The
-        # MockFrontend has no routing (ITL depends only on inflight), so it cannot
-        # see concentration — A0 and A1 must give identical victim ITLs here.
-        # The real externality requires >=2 workers + KV-aware routing on the box;
-        # a mock A0-vs-A1 difference would be a bug.
-        import json as _json
-
+    def test_a0_a1_identical_except_hash_ids(self):
+        # A0 (distributed) and A1 (concentrated) must differ ONLY in hash-id
+        # placement, which drives *routing* on a real multi-worker engine. Every
+        # load-affecting field — arrival timestamp, input/output length, request
+        # id, and the DAG (parent/wait_for) — must be identical, so the two arms
+        # are paired at matched server occupancy; the co-batch externality then
+        # comes purely from KV-aware routing co-locating the concentrated
+        # siblings. A difference in any load-affecting field would reintroduce a
+        # throughput confound and invalidate the A0-vs-A1 comparison.
+        #
+        # This is asserted directly on the trace, deterministically. Routing both
+        # traces through the async ReplayEngine + placement-blind MockFrontend
+        # (as an earlier version did) only added wall-clock jitter to victim ITL
+        # and could never observe concentration anyway — the real externality
+        # requires >=2 workers + KV-aware routing on the box.
         from trace_gen import WorkloadConfig, generate
 
-        def rows(distribute):
+        def gen(distribute):
             cfg = WorkloadConfig(n_tasks=50, fanout_k=8, burst_multiplier=8.0,
                                  shared_prefix_blocks=2, branch_unique_blocks=1,
                                  distribute_siblings=distribute)
-            return [_json.loads(r.to_json()) for r in generate(cfg, seed=11)]
+            return generate(cfg, seed=11)
 
-        r0 = _run(ReplayEngine(rows(True), Arm.A0, "m", MockFrontend(alpha=0.1)))
-        r1 = _run(ReplayEngine(rows(False), Arm.A1, "m", MockFrontend(alpha=0.1)))
+        a, b = gen(True), gen(False)
+        self.assertEqual(len(a), len(b))
 
-        def vmean(recs):
-            vals = [statistics.mean(r.itls_ms) for r in recs
-                    if r.role == "victim" and r.itls_ms]
-            return statistics.mean(vals) if vals else 0.0
+        def load_fields(r):
+            return (r.request_id, r.timestamp, r.input_length, r.output_length,
+                    r.parent, tuple(r.wait_for))
 
-        self.assertAlmostEqual(vmean(r0), vmean(r1), places=3)
+        self.assertEqual([load_fields(r) for r in a], [load_fields(r) for r in b])
+        # ...and the hash-id placement — the one knob — actually changes.
+        self.assertTrue(any(x.hash_ids != y.hash_ids for x, y in zip(a, b)))
 
     def test_metrics_helpers_run(self):
         rows = _trace(n_tasks=10)
