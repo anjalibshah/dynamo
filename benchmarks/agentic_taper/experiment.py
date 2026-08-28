@@ -39,8 +39,9 @@ import statistics
 from calibration import LoadSampler, summarize_calibration
 from latency_model import LatencyModel
 from replay_client import (Arm, HttpFrontend, MockFrontend, ReplayEngine,
-                           apply_server_metrics, parse_frontend_metrics,
-                           task_goodput, victim_tail, write_results)
+                           apply_server_metrics, concentration_report,
+                           parse_frontend_metrics, task_goodput, victim_tail,
+                           write_results)
 from trace_gen import WorkloadConfig, generate
 
 
@@ -147,13 +148,15 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
                    dry_run: bool, n_tasks: int, max_concurrency: int,
                    frontend_log: str | None = None,
                    words_per_block: int = 32, latency_model=None) -> Cell:
+    arm = Arm(cell.arm)
+    # A0 is the distributed baseline (siblings spread across workers); A1/A2/A3 use
+    # the concentrated trace. Only hash-id placement differs from A1 — matched load.
     cfg = WorkloadConfig(n_tasks=60 if dry_run else n_tasks, fanout_k=cell.fanout_k,
                          burst_multiplier=cell.burst,
                          shared_prefix_blocks=cell.prefix_blocks,
+                         distribute_siblings=(arm is Arm.A0),
                          agent_policy_class="agents", victim_policy_class="latency")
     rows = [json.loads(r.to_json()) for r in generate(cfg, cell.seed)]
-
-    arm = Arm(cell.arm)
     frontend = (MockFrontend(alpha=0.08) if dry_run
                 else HttpFrontend(model.base_url, model.served_model_name,
                                   max_conns=max_concurrency))
@@ -202,6 +205,12 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
         await asyncio.sleep(1.0)
         matched = apply_server_metrics(records, parse_frontend_metrics(frontend_log))
         print(f"    server-metrics matched {matched}/{len(records)} requests")
+        if arm in (Arm.A0, Arm.A1):
+            cr = concentration_report(records)
+            if cr["tasks"]:
+                want = "concentrated ~1" if arm is Arm.A1 else "distributed ~fanout_k"
+                print(f"    concentration: {cr['mean_distinct_workers']} distinct "
+                      f"workers/task (expect {want})")
         if matched == 0:
             raise SystemExit(
                 f"--frontend-log matched 0/{len(records)} requests — the log exists but "

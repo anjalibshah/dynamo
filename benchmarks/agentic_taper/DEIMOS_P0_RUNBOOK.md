@@ -309,11 +309,18 @@ python3 trace_adapter.py --in agentic.jsonl --out replay.jsonl
 
 ---
 
-## Arm → gate map (one variable changes)
+## Arm → (trace, gate) map — REDESIGNED Aug 2026
 
-| Arm | Gate config | Set where |
-|-----|-------------|-----------|
-| A0 | `STATIC_CAP, k=1` — one request per task (baseline) | trace/gate |
-| A1 | `EAGER` — admit as deps clear | gate |
-| A2 | `STATIC_CAP, k=K` — fixed per-task cap | `--` swept caps |
-| A3 | `FPM, load_threshold=τ` on live `num_decode_requests` | swept τ |
+| Arm | Trace | Gate | Isolates |
+|-----|-------|------|----------|
+| A0 | **distributed** (`distribute_siblings=True`) | `EAGER` | fan-out spread across workers (baseline) |
+| A1 | concentrated (shared prefix) | `EAGER` | fan-out on one worker |
+| A2 | concentrated | `STATIC_CAP, k=K` | static cap on the concentrated burst |
+| A3 | concentrated | `FPM` budget rule (`--latency-model`) | admit while projected T(S) ≤ SLO |
+
+> **A0 changed meaning.** Old A0 (`STATIC_CAP k=1`, serialized) confounded fan-out
+> with throughput and is dropped. New A0 = distributed + eager. **Old `results_h1_full`
+> A0 is NOT comparable to new A0** — use a fresh outdir. Requires ≥2 workers +
+> KV-aware routing; else A0≡A1 (concentration didn't happen — the run prints a
+> per-cell `concentration:` line: expect ~1 distinct worker/task for A1,
+> ~fanout_k for A0).
