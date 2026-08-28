@@ -161,12 +161,13 @@ python3 experiment.py --dry-run --reps 1        # offline wiring check, MockFron
   `docker compose -f deploy/docker-compose.yml up -d etcd nats`.
 
 
-Container (model-specific dev image; all GPUs visible so the worker uses
-`CUDA_VISIBLE_DEVICES` to pick devices):
+Container (model-specific dev image; expose **≥2 GPUs** so the redesigned A0/A1
+can run a multi-worker pool — each `dynamo.vllm` picks its device via
+`CUDA_VISIBLE_DEVICES`. Adjust the device list to what's free on the shared box):
 
 ```bash
 docker run --rm -it \
-  --gpus '"device=0"' --ipc=host --network=host \
+  --gpus '"device=0,1,2,3"' --ipc=host --network=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -v /mnt/scratch/anjshah/model-cache:/model-cache \
   -v /mnt/scratch/anjshah/agentic_taper:/workspace/agentic_taper \
@@ -207,13 +208,24 @@ cd /workspace/agentic_taper
 export DYN_NAMESPACE=taper-anjshah
 export FRONT_PORT=8002        # pick a FREE port (8000/8001 have been occupied); see preflight
 
-# 1a. Frontend
-python3 -m dynamo.frontend --trust-remote-code --http-port $FRONT_PORT &
+# 1a. Frontend — KV-AWARE ROUTING IS REQUIRED for the redesigned A0/A1 (else A0≡A1).
+#     --router-mode kv routes by KV overlap + active load: A1's concentrated siblings
+#     share the root prefix -> co-locate on one worker; A0's distributed siblings have
+#     unique prefixes -> spread across the pool. Log to a file so the harness can read
+#     server-side ITL AND the per-request decode_worker_id the concentration check needs.
+python3 -m dynamo.frontend --trust-remote-code \
+  --router-mode kv --http-port $FRONT_PORT > /tmp/frontend.log 2>&1 &
 sleep 5
 curl -s http://localhost:$FRONT_PORT/v1/models   # empty model list, no bind error
 
-# 1b. Nemotron worker (agg; -DSpark is the vLLM speculative DRAFT, num_speculative_tokens=7)
-python3 -m dynamo.vllm \
+# 1b. Nemotron worker POOL (agg; -DSpark is the vLLM speculative DRAFT, num_speculative_tokens=7).
+#     Launch ONE worker per GPU, same served name -> they register as a pool the KV
+#     router load-balances across. >=2 workers is the precondition for A0!=A1; more
+#     workers let A0 spread higher-fanout tasks (fanout_k is swept {2,5,10}). Each
+#     worker is TP=1 and a ~30B NVFP4 model fits one H100, so 4 workers on GPUs 0-3.
+NUM_WORKERS=4     # must be >=2; match the --gpus device list above and free GPUs on the box
+for g in $(seq 0 $((NUM_WORKERS-1))); do
+CUDA_VISIBLE_DEVICES=$g python3 -m dynamo.vllm \
   --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
   --served-model-name nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
   --trust-remote-code --tensor-parallel-size 1 --gpu-memory-utilization 0.85 \
@@ -225,9 +237,17 @@ python3 -m dynamo.vllm \
   --dyn-tool-call-parser nemotron_nano --dyn-reasoning-parser nemotron_nano \
   --reasoning-parser nemotron_v3 \
   --speculative-config '{"method":"dspark","model":"nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN"}' \
-  --disaggregation-mode agg > /tmp/worker.log 2>&1 &
-tail -f /tmp/worker.log                        # wait for "ready"; Ctrl-C the tail once up
+  --disaggregation-mode agg > /tmp/worker_$g.log 2>&1 &
+done
+# Wait for ALL workers to register (first run downloads weights — several GB, be patient):
+grep -l -m1 ready /tmp/worker_*.log 2>/dev/null; tail -f /tmp/worker_0.log   # Ctrl-C once up
+# Confirm the pool size the frontend sees (want NUM_WORKERS instances):
+curl -s http://localhost:$FRONT_PORT/v1/models | jq
 ```
+> **Concentration depends on the pool actually forming.** If only 1 worker registers
+> (GPU OOM, a worker crash, or all workers landing on the same device), KV routing has
+> nowhere to spread and A0 silently collapses to A1. The per-cell `concentration:` line
+> (§2.1 / §3) is the gate — verify A1≈1 and A0≈fanout_k BEFORE trusting any H1 number.
 
 The second model (Qwen3.6-35B-A3B, recipe `recipes/qwen3.6-35b-a3b/vllm/agg`)
 deploys the same way; `manifest.jsonl` merges runs, so deploy one, run, swap, run.
