@@ -40,8 +40,8 @@ from calibration import LoadSampler, summarize_calibration
 from latency_model import LatencyModel
 from replay_client import (Arm, HttpFrontend, MockFrontend, ReplayEngine,
                            apply_server_metrics, concentration_report,
-                           parse_frontend_metrics, task_goodput, victim_tail,
-                           write_results)
+                           discover_worker_ids, parse_frontend_metrics,
+                           task_goodput, victim_tail, write_results)
 from trace_gen import WorkloadConfig, generate
 
 
@@ -147,7 +147,9 @@ def build_cells(models, sweep: Sweep, arms=None) -> list[Cell]:
 async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
                    dry_run: bool, n_tasks: int, max_concurrency: int,
                    frontend_log: str | None = None,
-                   words_per_block: int = 32, latency_model=None) -> Cell:
+                   words_per_block: int = 32, latency_model=None,
+                   worker_ids=None, pin_mode: str = "auto",
+                   load_source_kind: str = "fpm") -> Cell:
     arm = Arm(cell.arm)
     # A0 is the distributed baseline (siblings spread across workers); A1/A2/A3 use
     # the concentrated trace. Only hash-id placement differs from A1 — matched load.
@@ -165,12 +167,13 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
     # matrix executes offline in seconds.
     kwargs = {"clock_scale": 0.02 if dry_run else 1.0,
               "max_concurrency": max_concurrency,
-              "words_per_block": words_per_block}
+              "words_per_block": words_per_block,
+              "worker_ids": worker_ids, "pin_mode": pin_mode}
     load_source = None
     if arm is Arm.A2:
         kwargs["k"] = int(cell.param)
     elif arm is Arm.A3:
-        load_source = _make_load_source(model, dry_run)
+        load_source = _make_load_source(model, dry_run, load_source_kind)
         kwargs["load_source"] = load_source
         kwargs["drain_interval_ms"] = sweep.drain_ms[0]
         if latency_model is not None:
@@ -182,8 +185,8 @@ async def run_cell(cell: Cell, model: ModelSpec, sweep: Sweep, outdir: str,
             kwargs["load_threshold"] = cell.param   # legacy raw-threshold sweep
 
     eng = ReplayEngine(rows, arm, model.served_model_name, frontend, **kwargs)
-    if arm is Arm.A3 and dry_run:
-        # Mock load source reads the engine's in-flight count.
+    if arm is Arm.A3 and (dry_run or load_source_kind == "client"):
+        # Mock/client load source reads the engine's in-flight count.
         load_source.bind(eng)  # type: ignore[union-attr]
 
     records = await eng.run()
@@ -232,8 +235,12 @@ _FPM_ENDPOINT = None
 _LIVE_FPM_SOURCE = None
 
 
-def _make_load_source(model: ModelSpec, dry_run: bool):
-    if dry_run:
+def _make_load_source(model: ModelSpec, dry_run: bool, kind: str = "fpm"):
+    # "client": use the replay client's own in-flight count as the load signal
+    # instead of server FPM. Valid when the client is the sole traffic source and
+    # everything lands on one worker (--pin-mode single), where client inflight ≈
+    # that worker's decode load. Lets A3 run without a verified FPM event path.
+    if dry_run or kind == "client":
         from load_source import MockLoadSource
 
         class _Bindable(MockLoadSource):
@@ -295,8 +302,29 @@ async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
                      max_concurrency: int = 64,
                      frontend_log: str | None = None,
                      words_per_block: int = 32, arms=None,
-                     latency_model=None) -> list[Cell]:
+                     latency_model=None, worker_ids=None,
+                     pin_mode: str = "auto",
+                     load_source_kind: str = "fpm") -> list[Cell]:
     os.makedirs(outdir, exist_ok=True)
+    # Worker pinning: the KV router load-balances shared-prefix siblings on this
+    # model, so A1 won't concentrate via routing. Pin each request to a named
+    # decode worker instead. Discover the pool from the frontend log unless the
+    # caller passed an explicit list. No workers found on a live run => pinning is
+    # off and A0/A1 collapse, so fail LOUDLY rather than emit a worthless matrix.
+    if worker_ids is None and frontend_log and not dry_run:
+        worker_ids = discover_worker_ids(frontend_log)
+    if not dry_run and not worker_ids:
+        raise SystemExit(
+            f"No decode worker ids discovered from --frontend-log ({frontend_log}). "
+            f"Pinning would be OFF and the load-aware router will spread A1 exactly "
+            f"like A0 (A0==A1, invalid). Ensure the frontend log has the startup "
+            f"'Adding worker … worker_id: N' lines, or pass --worker-ids.")
+    if worker_ids:
+        if pin_mode == "single":
+            print(f"    pin-mode=single: co-locating ALL requests on worker "
+                  f"{worker_ids[0]} (shared decode step; {len(worker_ids)-1} workers idle)")
+        else:
+            print(f"    pinning across {len(worker_ids)} workers: {worker_ids}")
     cells = build_cells(models, sweep, arms)
     if limit:
         cells = cells[:limit]
@@ -305,7 +333,8 @@ async def run_matrix(models, sweep: Sweep, outdir: str, dry_run: bool,
         model = next(m for m in models if m.label == cell.model)
         res = await run_cell(cell, model, sweep, outdir, dry_run,
                              n_tasks, max_concurrency, frontend_log,
-                             words_per_block, latency_model)
+                             words_per_block, latency_model, worker_ids, pin_mode,
+                             load_source_kind)
         done.append(res)
         print(f"[{i+1}/{len(cells)}] {res.name()}  goodput={res.goodput}  "
               f"victim_p95_itl={res.victim_p95_itl_ms}ms")
@@ -436,6 +465,25 @@ def main() -> None:
     p.add_argument("--base-url", default=None,
                    help="override the frontend URL for all selected models "
                         "(e.g. http://localhost:8000)")
+    p.add_argument("--worker-ids", default=None,
+                   help="comma-separated decode-worker instance ids to pin to "
+                        "(A0 spreads a task's branches across them, A1/A2/A3 "
+                        "concentrate). Default: auto-discover from --frontend-log. "
+                        "Pinning is required because the KV router load-balances "
+                        "shared-prefix siblings on this model and won't co-locate them.")
+    p.add_argument("--load-source", default="fpm", choices=("fpm", "client"),
+                   dest="load_source_kind",
+                   help="A3 load signal. fpm (default): server ForwardPassMetrics "
+                        "over the event plane (must be verified flowing). client: "
+                        "the replay client's in-flight count — valid with --pin-mode "
+                        "single (client is sole traffic, one worker), and avoids the "
+                        "FPM dependency.")
+    p.add_argument("--pin-mode", default="auto", choices=("auto", "single"),
+                   help="auto (default): A0 spreads branches, A1/A2/A3 concentrate "
+                        "per task. single: co-locate ALL requests on one worker — "
+                        "the faithful shared-decode-step test (sweep K within A1 for "
+                        "the externality; A1 vs A2/A3 for the gate). Use fewer "
+                        "--n-tasks in single mode (one worker carries the whole load).")
     a = p.parse_args()
     sweep = Sweep()
     if a.reps is not None:
@@ -476,13 +524,18 @@ def main() -> None:
         except ValueError:
             raise SystemExit(f"unknown arm(s) in {want}; valid: A0,A1,A2,A3")
 
+    worker_ids = None
+    if a.worker_ids:
+        worker_ids = [int(s) for s in a.worker_ids.split(",") if s.strip()]
+
     cells = build_cells(models, sweep, arms)
     armstr = ",".join(x.value for x in arms) if arms else "A0,A1,A2,A3"
     print(f"matrix: {len(models)} model(s) x [{armstr}] x sweep = {len(cells)} cells "
           f"({'DRY RUN' if a.dry_run else 'LIVE'})")
     asyncio.run(run_matrix(models, sweep, a.outdir, a.dry_run, a.limit,
                            a.n_tasks, a.max_concurrency, a.frontend_log,
-                           a.words_per_block, arms, latency_model))
+                           a.words_per_block, arms, latency_model, worker_ids,
+                           a.pin_mode, a.load_source_kind))
 
 
 if __name__ == "__main__":

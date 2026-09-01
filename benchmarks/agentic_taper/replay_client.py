@@ -30,6 +30,7 @@ import enum
 import json
 import re
 import statistics
+import zlib
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -100,7 +101,9 @@ class MockFrontend:
         self.time_scale = time_scale  # compress simulated ms -> wall seconds for fast tests
         self.engine = None          # set by ReplayEngine for the in-flight view
 
-    async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop):
+    async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop,
+                       backend_instance_id=None):
+        # backend_instance_id is ignored by the mock (no real workers to pin to).
         # Sample the shared decode-step width once at dispatch. One sleep for the
         # whole request (not per token): asyncio.sleep has a ~1 ms floor, so
         # per-token sleeps would make an offline matrix take minutes. Overlap
@@ -157,10 +160,18 @@ class HttpFrontend:
                 timeout=aiohttp.ClientTimeout(total=self.timeout_s))
         return self._session
 
-    async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop):
+    async def complete(self, *, prompt, max_tokens, headers, record: Timing, loop,
+                       backend_instance_id=None):
         session = await self._ensure_session()
         body = {"model": self.model, "prompt": prompt, "max_tokens": max_tokens,
                 "temperature": 0.0, "stream": True}
+        if backend_instance_id is not None:
+            # Deterministic worker pinning (P0). The KV router load-balances
+            # shared-prefix siblings on this Mamba-hybrid model (no reliable
+            # KV-event overlap signal), so it will NOT co-locate A1's branches.
+            # We name the decode worker directly instead: nvext.backend_instance_id
+            # is the u64 worker instance id, routed via push_router's direct path.
+            body["nvext"] = {"backend_instance_id": backend_instance_id}
         last = None
         try:
             async with session.post(self.base_url + self.path, json=body, headers=headers) as resp:
@@ -219,7 +230,8 @@ class ReplayEngine:
                  k: Optional[int] = None, load_source=None, load_threshold=None,
                  drain_interval_ms: float = 50.0, words_per_block: int = 400,
                  clock_scale: float = 1.0, max_concurrency: int = 64,
-                 latency_model=None, slo_ms: Optional[float] = None):
+                 latency_model=None, slo_ms: Optional[float] = None,
+                 worker_ids: Optional[list] = None, pin_mode: str = "auto"):
         self.rows = rows
         self.arm = arm
         self.model = model
@@ -244,6 +256,25 @@ class ReplayEngine:
         # Compress open-loop arrival timing. Keep 1.0 for real runs (true
         # inter-arrival timing matters); use <1 only for fast offline dry-runs.
         self.clock_scale = clock_scale
+
+        # Deterministic worker pinning. When worker_ids is given (live A0/A1/A2/A3),
+        # each request names its decode worker directly instead of trusting the KV
+        # router, which load-balances shared-prefix siblings on this model. A0
+        # SPREADS a task's branches across the pool; A1/A2/A3 CONCENTRATE them on
+        # one worker. victim/root/join are pinned identically in every arm (by task
+        # hash), so A0 and A1 differ ONLY in branch placement at matched occupancy.
+        self._worker_ids = list(worker_ids) if worker_ids else []
+        # pin_mode: "auto" (A0 spreads a task's branches, A1/A2/A3 concentrate),
+        # "single" (everything on one worker — the faithful shared-decode-step
+        # test: co-locate victims with all fan-out, vary admitted load via arm/K).
+        self.pin_mode = pin_mode
+        self._branch_idx: dict[str, int] = {}
+        _bcount: dict[str, int] = {}
+        for r in rows:
+            if r.get("role") == "branch":
+                t = r["task_id"]
+                self._branch_idx[r["request_id"]] = _bcount.get(t, 0)
+                _bcount[t] = _bcount.get(t, 0) + 1
 
         self.by_id = {r["request_id"]: r for r in rows}
         self.done_events: dict[str, asyncio.Event] = {}
@@ -288,6 +319,29 @@ class ReplayEngine:
             h[HEADER_PARENT] = row["parent"]
         return h
 
+    def _target_worker(self, row: dict):
+        # None => let the router decide (pinning disabled).
+        if not self._worker_ids:
+            return None
+        n = len(self._worker_ids)
+        if self.pin_mode == "single":
+            # One shared decode step: co-locate EVERY request (victims + all
+            # aggressor fan-out) on one worker, regardless of arm. This is the
+            # faithful TAPER externality test — sweep K within A1 to watch the
+            # victim tail rise, and A2/A3 to watch the gate hold that load back.
+            # Distribution is disabled on purpose (the other workers idle).
+            return self._worker_ids[0]
+        if self.arm not in (Arm.A0, Arm.A1, Arm.A2, Arm.A3):
+            return None
+        # crc32 (not hash()) so placement is stable across processes/runs.
+        base = zlib.crc32(row["task_id"].encode()) % n
+        if self.arm is Arm.A0 and row.get("role") == "branch":
+            # Distributed baseline: fan a task's branches across the pool.
+            idx = self._branch_idx.get(row["request_id"], 0)
+            return self._worker_ids[(base + idx) % n]
+        # Concentrated arms, and every arm's victim/root/join: one worker per task.
+        return self._worker_ids[base]
+
     def _on_admit(self, req: GateRequest) -> None:
         # Gate released the request; dispatch it.
         row = req.payload
@@ -307,7 +361,8 @@ class ReplayEngine:
             async with self._sema:
                 await self.frontend.complete(
                     prompt=prompt, max_tokens=row["output_length"],
-                    headers=self._headers(row), record=rec, loop=self._loop)
+                    headers=self._headers(row), record=rec, loop=self._loop,
+                    backend_instance_id=self._target_worker(row))
         finally:
             self.inflight -= 1
             self._gate.on_complete(row["task_id"])
@@ -388,6 +443,31 @@ _OUT_RE = re.compile(r'output_tokens=(\d+)')
 _TTFT_RE = re.compile(r'ttft_ms="([0-9.]+)"')
 _ITL_RE = re.compile(r'avg_itl_ms="([0-9.]+)"')
 _WORKER_RE = re.compile(r'decode_worker_id=(\d+)')
+# Startup line: "Adding worker WorkerWithDpRank { worker_id: 7587896489018078403, ... }"
+_ADD_WORKER_RE = re.compile(r'worker_id:\s*(\d+)')
+
+
+def discover_worker_ids(log_path: str) -> list:
+    """Distinct decode-worker instance ids the frontend knows about, read from its
+    log. Used to pin requests (nvext.backend_instance_id) so A1 concentrates and A0
+    spreads deterministically — the KV router won't co-locate shared-prefix siblings
+    on this model. Reads both the startup "Adding worker … worker_id: N" lines and
+    any decode_worker_id=N on completed requests; returns them sorted for a stable
+    task->worker mapping across runs."""
+    ids: set = set()
+    try:
+        with open(log_path, "r", errors="ignore") as f:
+            for line in f:
+                s = _ANSI_RE.sub("", line)
+                if "Adding worker" in s:
+                    for m in _ADD_WORKER_RE.finditer(s):
+                        ids.add(int(m.group(1)))
+                m = _WORKER_RE.search(s)
+                if m:
+                    ids.add(int(m.group(1)))
+    except FileNotFoundError:
+        return []
+    return sorted(ids)
 
 
 def parse_frontend_metrics(log_path: str) -> dict:

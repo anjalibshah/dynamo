@@ -112,6 +112,78 @@ class TestH2Verdict(unittest.TestCase):
         self.assertFalse(v["H2_supported"])
 
 
+class TestH1ColocatedVerdict(unittest.TestCase):
+    """H1 is judged on the CO-LOCATED victim externality, not the pooled median —
+    the externality is localized to victims sharing the fan-out's worker."""
+
+    def _colo(self, a0_p95, a1_p95):
+        base = {"victim_p95_isolated_ms": 20.0, "n_colocated": 10, "n_isolated": 20}
+        return {"m_A0_5_3.0": {"victim_p95_colocated_ms": a0_p95, **base},
+                "m_A1_5_3.0": {"victim_p95_colocated_ms": a1_p95, **base}}
+
+    def test_deltas_pair_a1_minus_a0(self):
+        self.assertEqual(analyze._colocated_ext_deltas(self._colo(30, 50), "m"), [20.0])
+
+    def test_supported_when_colocated_victims_hurt(self):
+        h1 = analyze.h1_verdict({}, "m", {"has_knee": True}, {}, self._colo(30, 50))
+        self.assertEqual(h1["colocated_externality_median_ms"], 20.0)
+        self.assertTrue(h1["H1_supported"])
+
+    def test_negative_when_colocated_flat(self):
+        # +0.5ms is below the 2ms noise threshold -> not supported.
+        h1 = analyze.h1_verdict({}, "m", {"has_knee": True}, {}, self._colo(30, 30.5))
+        self.assertFalse(h1["H1_supported"])
+
+    def test_negative_without_knee_even_if_victims_hurt(self):
+        h1 = analyze.h1_verdict({}, "m", {"has_knee": False}, {}, self._colo(30, 50))
+        self.assertFalse(h1["H1_supported"])
+
+    def test_pooled_median_negative_does_not_veto_colocated_positive(self):
+        # The whole point: pooled charged-externality median can be <=0 while the
+        # co-located signal is strongly positive; H1 must key on the latter.
+        ext = {"m_A1_5_3.0": {"median_delta_ms": -3.0}}
+        h1 = analyze.h1_verdict({}, "m", {"has_knee": True}, ext, self._colo(30, 50))
+        self.assertLess(h1["charged_externality_median_ms"], 0)
+        self.assertTrue(h1["H1_supported"])
+
+
+class TestSingleWorkerVerdicts(unittest.TestCase):
+    """--pin-mode single: no A0 baseline; H1 is A1's victim tail rising with
+    fan-out, H2a is a static cap beating eager at the contended cell."""
+
+    def _agg(self):
+        agg = {}
+        for b in (1.0, 3.0, 8.0):
+            for k, (g1, i1) in {2: (0.65, 37.0), 5: (0.46, 64.0), 10: (0.28, 71.0)}.items():
+                agg[("m", "A1", k, b, 8, 0)] = analyze.Agg(
+                    goodput_median=g1, victim_itl_p95_median=i1, throughput_median=1000)
+            for k, (g2, i2) in {2: (0.65, 30.0), 5: (0.67, 35.0), 10: (0.75, 31.0)}.items():
+                agg[("m", "A2", k, b, 8, 2)] = analyze.Agg(
+                    goodput_median=g2, victim_itl_p95_median=i2, throughput_median=1000)
+        return agg
+
+    def test_h1_supported_when_a1_tail_rises_with_fanout_no_a0(self):
+        h1 = analyze.h1_verdict(self._agg(), "m", {"has_knee": False}, {}, {})
+        self.assertEqual(h1["h1_basis"], "A1_victim_tail_rises_with_fanout")
+        self.assertGreater(h1["a1_victim_itl_span_ms"], 30)
+        self.assertTrue(h1["H1_supported"])  # no burst-knee required in this design
+
+    def test_h1_negative_when_a1_tail_flat_across_fanout(self):
+        agg = {("m", "A1", k, 8.0, 8, 0): analyze.Agg(goodput_median=0.5,
+               victim_itl_p95_median=30.0, throughput_median=1000)
+               for k in (2, 5, 10)}
+        h1 = analyze.h1_verdict(agg, "m", {"has_knee": False}, {}, {})
+        self.assertFalse(h1["H1_supported"])
+
+    def test_gate_beats_eager_at_contended_cell(self):
+        g = analyze.gate_vs_eager_verdict(self._agg(), "m")
+        self.assertTrue(g["decidable"])
+        self.assertEqual((g["k"], g["burst"]), (10, 8.0))   # worst fan-out, top load
+        self.assertTrue(g["gate_cuts_victim_tail"])          # 31 < 71
+        self.assertTrue(g["gate_keeps_goodput"])             # 0.75 >= 0.28
+        self.assertTrue(g["H2a_supported"])
+
+
 class TestSloSweep(unittest.TestCase):
     def test_victim_goodput_at_slo(self):
         recs = [_rec("v0-req", "victim", [10.0]), _rec("v1-req", "victim", [20.0]),
