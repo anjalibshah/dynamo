@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from load_source import MockLoadSource  # noqa: E402
 from replay_client import (Arm, MockFrontend, ReplayEngine, HEADER_PARENT,  # noqa: E402
                            HEADER_SESSION, Timing, apply_server_metrics,
-                           concentration_report, parse_frontend_metrics,
-                           task_goodput, victim_tail)
+                           concentration_report, discover_worker_ids,
+                           parse_frontend_metrics, task_goodput, victim_tail)
 from trace_gen import WorkloadConfig, generate  # noqa: E402
 
 
@@ -36,10 +36,12 @@ class HeaderCapturingFrontend(MockFrontend):
         super().__init__(**kw)
         self.seen = {}
 
-    async def complete(self, *, prompt, max_tokens, headers, record, loop):
+    async def complete(self, *, prompt, max_tokens, headers, record, loop,
+                       backend_instance_id=None):
         self.seen[record.request_id] = dict(headers)
         await super().complete(prompt=prompt, max_tokens=max_tokens,
-                               headers=headers, record=record, loop=loop)
+                               headers=headers, record=record, loop=loop,
+                               backend_instance_id=backend_instance_id)
 
 
 def _run(engine):
@@ -215,6 +217,99 @@ class ServerMetricsTest(unittest.TestCase):
         recs = [Timing(request_id="v", task_id="t", role="victim", arm="A1",
                        model="m", server_worker_id="W1")]
         self.assertEqual(concentration_report(recs)["tasks"], 0)
+
+
+class TestWorkerPinning(unittest.TestCase):
+    """Deterministic worker pinning (nvext.backend_instance_id). The KV router
+    load-balances shared-prefix siblings on this model, so concentration must be
+    enforced client-side: A1 concentrates a task's branches on one worker, A0
+    spreads them, and victim/root are placed identically so only branch placement
+    differs (matched occupancy)."""
+
+    ROWS = [
+        {"request_id": "agg-root", "task_id": "agg", "role": "root", "session_id": "s"},
+        {"request_id": "agg-b0", "task_id": "agg", "role": "branch", "session_id": "s"},
+        {"request_id": "agg-b1", "task_id": "agg", "role": "branch", "session_id": "s"},
+        {"request_id": "agg-b2", "task_id": "agg", "role": "branch", "session_id": "s"},
+        {"request_id": "agg-join", "task_id": "agg", "role": "join", "session_id": "s"},
+        {"request_id": "vic-0", "task_id": "vic", "role": "victim", "session_id": "v"},
+    ]
+    WIDS = [100, 200, 300]
+
+    def _targets(self, arm):
+        eng = ReplayEngine(self.ROWS, arm, "m", MockFrontend(), worker_ids=self.WIDS)
+        return {r["request_id"]: eng._target_worker(r) for r in self.ROWS}
+
+    def test_a1_concentrates_branches_on_one_worker(self):
+        t = self._targets(Arm.A1)
+        self.assertEqual(len({t["agg-b0"], t["agg-b1"], t["agg-b2"]}), 1)
+
+    def test_a0_spreads_branches_across_pool(self):
+        t = self._targets(Arm.A0)
+        self.assertEqual({t["agg-b0"], t["agg-b1"], t["agg-b2"]}, set(self.WIDS))
+
+    def test_victim_and_root_placement_matched_across_arms(self):
+        a0, a1 = self._targets(Arm.A0), self._targets(Arm.A1)
+        self.assertEqual(a0["vic-0"], a1["vic-0"])
+        self.assertEqual(a0["agg-root"], a1["agg-root"])
+
+    def test_pinning_off_without_worker_ids(self):
+        eng = ReplayEngine(self.ROWS, Arm.A1, "m", MockFrontend(), worker_ids=None)
+        self.assertIsNone(eng._target_worker(self.ROWS[1]))
+
+    def test_single_mode_colocates_everything_on_one_worker(self):
+        # The faithful shared-decode-step test: every request (any role, any arm)
+        # lands on worker_ids[0], so the victim shares the aggressor's decode step.
+        for arm in (Arm.A0, Arm.A1, Arm.A2):
+            eng = ReplayEngine(self.ROWS, arm, "m", MockFrontend(),
+                               worker_ids=self.WIDS, pin_mode="single")
+            targets = {eng._target_worker(r) for r in self.ROWS}
+            self.assertEqual(targets, {self.WIDS[0]})
+
+    def test_backend_instance_id_reaches_request_body(self):
+        # The pinned worker id must land in the OpenAI body as nvext.backend_instance_id.
+        from replay_client import HttpFrontend
+        captured = {}
+
+        class _Body(HttpFrontend):
+            async def _ensure_session(self):
+                class _Resp:
+                    async def __aenter__(s): return s
+                    async def __aexit__(s, *a): return False
+                    def raise_for_status(s): pass
+                    @property
+                    def content(s): return iter(())
+                class _Sess:
+                    def post(s, url, json, headers):
+                        captured.update(json)
+                        return _Resp()
+                return _Sess()
+
+        async def _drive():
+            fe = _Body("http://x", "m")
+            rec = Timing(request_id="r", task_id="t", role="branch", arm="A1", model="m")
+            await fe.complete(prompt="p", max_tokens=8, headers={}, record=rec,
+                              loop=asyncio.get_event_loop(), backend_instance_id=200)
+        asyncio.run(_drive())
+        self.assertEqual(captured.get("nvext"), {"backend_instance_id": 200})
+
+
+class TestWorkerDiscovery(unittest.TestCase):
+    def test_parses_add_worker_and_decode_worker_lines(self):
+        import tempfile
+        log = ("... Adding worker WorkerWithDpRank { worker_id: 7587896489018078403, dp_rank: 0 }\n"
+               "... request completed ... decode_worker_id=7587896489018078406\n")
+        p = tempfile.mktemp()
+        with open(p, "w") as f:
+            f.write(log)
+        try:
+            self.assertEqual(discover_worker_ids(p),
+                             [7587896489018078403, 7587896489018078406])
+        finally:
+            os.unlink(p)
+
+    def test_missing_log_returns_empty(self):
+        self.assertEqual(discover_worker_ids("/no/such/frontend.log"), [])
 
 
 if __name__ == "__main__":

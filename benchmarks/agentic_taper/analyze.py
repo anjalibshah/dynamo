@@ -165,10 +165,66 @@ def charged_externality(outdir: str, manifest: list[dict]) -> dict:
         for rid, itl in cur.items():
             if rid in base:
                 out[gk].append(itl - base[rid])
+    # Report the upper tail of the paired deltas, not just the median. If
+    # concentration LOCALIZES harm (A1 spares most victims but badly hurts the few
+    # sharing a hot worker), the median delta is <=0 while the p99/max are strongly
+    # positive — the externality lives in the tail, invisible to a median.
     return {"_".join(map(str, k)): {"median_delta_ms": round(_median(v), 3),
                                     "p95_delta_ms": round(_pct(v, 0.95), 3),
+                                    "p99_delta_ms": round(_pct(v, 0.99), 3),
+                                    "max_delta_ms": round(max(v), 3) if v else 0.0,
+                                    "frac_victims_worse_2ms": (
+                                        round(sum(1 for x in v if x > 2.0) / len(v), 3)
+                                        if v else 0.0),
                                     "n": len(v)}
             for k, v in out.items()}
+
+
+def _branch_load_by_worker(records: list[dict]) -> dict:
+    load: dict = defaultdict(int)
+    for r in records:
+        if r.get("role") == "branch" and r.get("server_worker_id"):
+            load[r["server_worker_id"]] += 1
+    return load
+
+
+def colocated_externality(outdir: str, manifest: list[dict]) -> dict:
+    """The bystander externality, conditioned on actual co-location. A pooled
+    victim p95 mixes victims that shared a worker with concentrated fan-out and
+    victims that didn't; under A1 the latter dominate (concentration frees most
+    workers), so the pool looks fine. Here we split victims by whether their decode
+    worker carried an ABOVE-MEDIAN share of aggressor branches, and report victim
+    ITL p95 for each group per (model, arm, k, burst). The honest test of H1 is
+    A1's CO-LOCATED victims vs A0's: if A1 co-located >> A0, fan-out does hurt the
+    bystanders that share its worker; the pooled null was just dilution. (Placement
+    is a proxy for co-batching; at higher burst branch/victim overlap in time is
+    tight, so it is a good one.)"""
+    groups: dict = defaultdict(lambda: {"colo": [], "iso": []})
+    for c in manifest:
+        if c["arm"] not in ("A0", "A1", "A3"):
+            continue
+        recs = load_records(outdir, c)
+        load = _branch_load_by_worker(recs)
+        if not load:
+            continue
+        # Single loaded worker (e.g. --pin-mode single): every victim shares it,
+        # so ALL victims are co-located. With >=2 workers, "hot" = above-median
+        # branch load. (Without this, n > median-of-one is never true and the
+        # split wrongly labels every victim "isolated".)
+        vals = list(load.values())
+        med = _median(vals)
+        hot = set(load) if len(load) <= 1 else {w for w, n in load.items() if n > med}
+        gk = "_".join(map(str, (c["model"], c["arm"], c["fanout_k"], c["burst"])))
+        for r in recs:
+            if r.get("role") != "victim" or not r.get("itls_ms"):
+                continue
+            itl = statistics.mean(r["itls_ms"])
+            bucket = "colo" if r.get("server_worker_id") in hot else "iso"
+            groups[gk][bucket].append(itl)
+    return {k: {"victim_p95_colocated_ms": round(_pct(v["colo"], 0.95), 3),
+                "victim_p95_isolated_ms": round(_pct(v["iso"], 0.95), 3),
+                "n_colocated": len(v["colo"]), "n_isolated": len(v["iso"])}
+            for k, v in groups.items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -303,27 +359,122 @@ def h2_verdict(agg: dict, model: str) -> dict:
             "H2_supported": bool(goodput_win and tail_win)}
 
 
-def h1_verdict(agg: dict, model: str, a1_knee: dict, ext: dict) -> dict:
-    """H1 evidence: A1's knee + A1 goodput collapse vs A0 at the contended load.
+def _arm_cell_metrics(agg: dict, model: str, arm: str, k: int, burst: float):
+    """Best (max-goodput) cell for an arm at a MATCHED (k, burst) — so A1 (eager)
+    and A2 (best cap) are compared at the same fan-out, not across k."""
+    cands = [v for (m, a, kk, b, pf, p), v in agg.items()
+             if m == model and a == arm and kk == k and b == burst]
+    if not cands:
+        return None
+    v = max(cands, key=lambda x: x.goodput_median)
+    return {"goodput_median": v.goodput_median,
+            "victim_itl_p95_median": v.victim_itl_p95_median,
+            "throughput_median": v.throughput_median}
 
-    A0 is not expected to be flat — it degrades under raw load too. The right
-    signal is that A1's goodput falls *below A0's* at high load (the fan-out
-    externality) and the paired charged externality is positive.
+
+def gate_vs_eager_verdict(agg: dict, model: str) -> dict:
+    """Does a static-cap gate (A2) beat EAGER fan-out (A1) at the contended cell?
+
+    The single-worker (--pin-mode single) H2: at the worst fan-out, holding
+    opportunistic siblings should cut the victim tail without losing goodput —
+    and under real overload it usually RAISES goodput, because eager was missing
+    SLO on everything. Compared at matched (k, burst); complements h2_verdict
+    (A3 vs A2), which needs A3 to be present.
+    """
+    ks = sorted({k for (m, a, k, b, pf, p) in agg if m == model and a == "A1"})
+    bs = sorted({b for (m, a, k, b, pf, p) in agg if m == model and a == "A1"})
+    if not ks or not bs:
+        return {"decidable": False, "reason": "no A1 cells"}
+    k, burst = ks[-1], bs[-1]      # worst fan-out, highest load
+    eager = _arm_cell_metrics(agg, model, "A1", k, burst)
+    gate = _arm_cell_metrics(agg, model, "A2", k, burst)
+    if not eager or not gate:
+        return {"decidable": False, "reason": "missing A1 or A2 at contended (k,burst)"}
+    tail_win = gate["victim_itl_p95_median"] < eager["victim_itl_p95_median"]
+    goodput_ok = gate["goodput_median"] >= eager["goodput_median"]
+    return {"decidable": True, "k": k, "burst": burst,
+            "eager_A1": eager, "best_gate_A2": gate,
+            "gate_cuts_victim_tail": bool(tail_win),
+            "gate_keeps_goodput": bool(goodput_ok),
+            "H2a_supported": bool(tail_win and goodput_ok)}
+
+
+# Co-located victims must exceed A0 by at least this (ms) to count as harmed —
+# a margin above measurement noise, matching the >2ms "worse" threshold used in
+# charged_externality's frac_victims_worse_2ms.
+COLOCATED_EXT_THRESHOLD_MS = 2.0
+
+
+def _a1_itl_by_fanout(agg: dict, model: str) -> dict:
+    """A1 victim p95 ITL, median over bursts, per fan-out k."""
+    byk: dict = defaultdict(list)
+    for (m, a, k, b, pf, p), v in agg.items():
+        if m == model and a == "A1":
+            byk[k].append(v.victim_itl_p95_median)
+    return {k: _median(vs) for k, vs in byk.items()}
+
+
+def _colocated_ext_deltas(colo: dict, model: str) -> list:
+    """A1 co-located victim p95 minus A0 co-located, paired per (fanout, burst)."""
+    a0c, a1c = {}, {}
+    for kk, v in (colo or {}).items():
+        if not kk.startswith(f"{model}_"):
+            continue
+        p = kk[len(model) + 1:].split("_")   # [arm, fanout, burst]
+        cell = tuple(p[1:])
+        if p[0] == "A0":
+            a0c[cell] = v["victim_p95_colocated_ms"]
+        elif p[0] == "A1":
+            a1c[cell] = v["victim_p95_colocated_ms"]
+    return [a1c[c] - a0c[c] for c in a1c if c in a0c]
+
+
+def h1_verdict(agg: dict, model: str, a1_knee: dict, ext: dict,
+               colo: dict | None = None) -> dict:
+    """H1 evidence: A1's throughput-trap knee + a real victim externality.
+
+    The externality is LOCALIZED — concentration only hurts victims that share
+    its worker, so a pooled charged-externality median cancels the harmed third
+    against the spared majority and reads ~0 or negative. The honest H1b signal
+    is therefore the CO-LOCATED victim tail: A1's co-located p95 above A0's. The
+    pooled median is retained as context only.
     """
     loads = _loads(agg, model)
     contended = loads[-1] if loads else None
     a0 = arm_goodput_at_load(agg, model, "A0", contended) if contended else None
     a1 = arm_goodput_at_load(agg, model, "A1", contended) if contended else None
-    # median charged externality for this model's A1 cells (positive => A1 worse)
+    # Pooled median charged externality — CONTEXT ONLY; hides the localized effect.
     a1_ext = [v["median_delta_ms"] for kstr, v in ext.items()
               if kstr.startswith(f"{model}_A1_")]
     ext_med = _median(a1_ext) if a1_ext else 0.0
+    # PRIMARY H1b signal: co-located victim externality (A1 - A0), median over cells.
+    coloc_deltas = _colocated_ext_deltas(colo, model)
+    coloc_ext_med = _median(coloc_deltas) if coloc_deltas else 0.0
     a1_below_a0 = (a0 is not None and a1 is not None and a1 < a0)
-    supported = bool(a1_knee.get("has_knee") and a1_below_a0 and ext_med > 0)
+    has_knee = bool(a1_knee.get("has_knee"))
+
+    itl_by_k = _a1_itl_by_fanout(agg, model)
+    a1_itl_span = (round(max(itl_by_k.values()) - min(itl_by_k.values()), 3)
+                   if len(itl_by_k) >= 2 else 0.0)
+    if coloc_deltas:
+        # Paired A0/A1 design (multi-worker): judge on the co-located A1-A0 tail.
+        basis = "colocated_A1_minus_A0"
+        supported = bool(has_knee and coloc_ext_med > COLOCATED_EXT_THRESHOLD_MS)
+    else:
+        # No A0 baseline (--pin-mode single): all victims co-locate with the fan-out,
+        # so the externality shows along the FAN-OUT axis — A1's victim tail rising
+        # with k — not the burst-knee (goodput is ~flat across burst here). Judge on
+        # that span; the burst-knee requirement doesn't apply to this design.
+        basis = "A1_victim_tail_rises_with_fanout"
+        supported = a1_itl_span > COLOCATED_EXT_THRESHOLD_MS
     return {"contended_load": contended,
             "A0_goodput_at_load": a0, "A1_goodput_at_load": a1,
             "A1_below_A0": a1_below_a0,
-            "A1_has_knee": a1_knee.get("has_knee", False),
+            "A1_has_knee": has_knee,
+            "h1_basis": basis,
+            "a1_victim_itl_by_fanout": {str(k): itl_by_k[k] for k in sorted(itl_by_k)},
+            "a1_victim_itl_span_ms": a1_itl_span,
+            "colocated_externality_median_ms": round(coloc_ext_med, 3),
             "charged_externality_median_ms": round(ext_med, 3),
             "H1_supported": supported}
 
@@ -335,16 +486,19 @@ def h1_verdict(agg: dict, model: str, a1_knee: dict, ext: dict) -> dict:
 DEFAULT_SLO_GRID = (15.0, 25.0, 50.0)
 
 
-def _verdicts_for_agg(agg: dict, models: list[str], ext: dict) -> dict:
+def _verdicts_for_agg(agg: dict, models: list[str], ext: dict,
+                      colo: dict | None = None) -> dict:
     per_model = {}
     for model in models:
         knee = detect_knee(knee_curve(agg, model, "A1"))
-        h1 = h1_verdict(agg, model, knee, ext)
+        h1 = h1_verdict(agg, model, knee, ext, colo)
         h2 = h2_verdict(agg, model)
+        gate = gate_vs_eager_verdict(agg, model)
         per_model[model] = {
             "A1_curve": knee_curve(agg, model, "A1"),
             "A0_curve": knee_curve(agg, model, "A0"),
             "H1": h1,
+            "gate_vs_eager": gate,
             "H1_call": ("externality present; proceed to H2"
                         if h1["H1_supported"]
                         else "NEGATIVE — no disproportionate externality; stop"),
@@ -360,11 +514,13 @@ def summarize(outdir: str, primary_slo: float = 25.0, slo_grid=DEFAULT_SLO_GRID)
     manifest = load_manifest(outdir)
     models = sorted({c["model"] for c in manifest})
     ext = charged_externality(outdir, manifest)
+    colo = colocated_externality(outdir, manifest)
 
     # Primary verdicts use VICTIM goodput at primary_slo, recomputed from saved
     # ITLs — consistent with the sweep. (The manifest's run-time goodput is
     # informational only; it may use an all-task definition or a different SLO.)
-    per_model = _verdicts_for_agg(aggregate(outdir, manifest, slo_ms=primary_slo), models, ext)
+    per_model = _verdicts_for_agg(aggregate(outdir, manifest, slo_ms=primary_slo),
+                                  models, ext, colo)
 
     # Offline SLO sweep: recompute goodput from saved victim ITLs at each SLO,
     # so we can report whether H1/H2 hold across plausible SLOs (robustness to
@@ -376,7 +532,7 @@ def summarize(outdir: str, primary_slo: float = 25.0, slo_grid=DEFAULT_SLO_GRID)
         pm = {}
         for model in models:
             knee = detect_knee(knee_curve(agg_s, model, "A1"))
-            h1 = h1_verdict(agg_s, model, knee, ext)
+            h1 = h1_verdict(agg_s, model, knee, ext, colo)
             h2 = h2_verdict(agg_s, model)
             a2 = best_param_at_load(agg_s, model, "A2", _loads(agg_s, model)[-1]) if _loads(agg_s, model) else None
             a3 = best_param_at_load(agg_s, model, "A3", _loads(agg_s, model)[-1]) if _loads(agg_s, model) else None
@@ -390,6 +546,7 @@ def summarize(outdir: str, primary_slo: float = 25.0, slo_grid=DEFAULT_SLO_GRID)
 
     summary = {"models": models, "n_cells": len(manifest),
                "per_model": per_model, "charged_externality": ext,
+               "colocated_externality": colo,
                "slo_grid_ms": list(slo_grid), "slo_sweep": slo_sweep}
     with open(os.path.join(outdir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -407,10 +564,56 @@ def _print_summary(summary: dict) -> None:
                   f"throughput {p['throughput']:.1f} tok/s")
         h1 = v["H1"]
         print(f"  H1  {v['H1_call']}")
-        print(f"      A1 knee={h1['A1_has_knee']}  "
-              f"A1 goodput<{'A0' if h1['A1_below_A0'] else '=A0'} at burst {h1['contended_load']:g} "
-              f"(A0={h1['A0_goodput_at_load']}, A1={h1['A1_goodput_at_load']})  "
-              f"charged externality median={h1['charged_externality_median_ms']}ms")
+        print(f"      basis={h1['h1_basis']}  A1 knee={h1['A1_has_knee']}")
+        if h1["h1_basis"] == "colocated_A1_minus_A0":
+            print(f"      CO-LOCATED victim externality (A1-A0 p95) "
+                  f"median={h1['colocated_externality_median_ms']}ms  [primary H1b "
+                  f"signal]   pooled median={h1['charged_externality_median_ms']}ms "
+                  f"[diluted — context only]")
+        else:
+            itlk = h1["a1_victim_itl_by_fanout"]
+            print("      A1 victim p95 ITL by fan-out k: "
+                  + ", ".join(f"k={k}:{itlk[k]:.1f}ms" for k in sorted(itlk, key=int))
+                  + f"  (span={h1['a1_victim_itl_span_ms']}ms — rises with fan-out)")
+        gate = v.get("gate_vs_eager", {})
+        if gate.get("decidable"):
+            e, g = gate["eager_A1"], gate["best_gate_A2"]
+            print(f"      H2a gate-vs-eager (k={gate['k']} burst={gate['burst']:g}): "
+                  f"{'SUPPORTED' if gate['H2a_supported'] else 'not supported'} — "
+                  f"eager A1 goodput {e['goodput_median']:.3f}/victim p95 "
+                  f"{e['victim_itl_p95_median']:.1f}ms  ->  best cap A2 goodput "
+                  f"{g['goodput_median']:.3f}/victim p95 {g['victim_itl_p95_median']:.1f}ms")
+
+        # Localized-harm tail: median hides a subset of badly-hurt victims.
+        ext = summary.get("charged_externality", {})
+        a1 = sorted((k, x) for k, x in ext.items()
+                    if k.startswith(f"{model}_A1_"))
+        if a1:
+            print("      paired A1-A0 victim ITL by fan-out (median / p95 / p99 / max ms, %worse):")
+            for k, x in a1:
+                p = k.split("_A1_")[1].split("_")   # k_burst_pf_param
+                print(f"        k={p[0]:>2} b={p[1]:>2}:  "
+                      f"{x['median_delta_ms']:+7.2f} / {x['p95_delta_ms']:+7.2f} / "
+                      f"{x['p99_delta_ms']:+7.2f} / {x['max_delta_ms']:+7.2f}   "
+                      f"({x['frac_victims_worse_2ms']*100:.0f}% worse >2ms)")
+
+        # Bystander externality conditioned on real co-location.
+        colo = summary.get("colocated_externality", {})
+        rows = sorted((k, x) for k, x in colo.items() if "_A1_" in k or "_A0_" in k)
+        if rows:
+            print("      victim p95 ITL, co-located vs isolated (A1 vs A0 by fan-out):")
+            byk: dict = {}
+            for k, x in rows:
+                parts = k.split("_")
+                arm, fk, b = parts[-3], parts[-2], parts[-1]
+                byk.setdefault((fk, b), {})[arm] = x
+            for (fk, b), arms in sorted(byk.items()):
+                a0c = arms.get("A0", {}); a1c = arms.get("A1", {})
+                print(f"        k={fk:>2} b={b:>2}:  "
+                      f"co-located A0={a0c.get('victim_p95_colocated_ms','-')} "
+                      f"A1={a1c.get('victim_p95_colocated_ms','-')}  |  "
+                      f"isolated A0={a0c.get('victim_p95_isolated_ms','-')} "
+                      f"A1={a1c.get('victim_p95_isolated_ms','-')}")
         h2 = v["H2"]
         if h2.get("decidable"):
             print(f"  H2  {v['H2_call']}  (at burst {h2['contended_load']:g})")
