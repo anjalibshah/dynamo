@@ -190,7 +190,8 @@ async def test_metrics_snapshot_counters():
 async def test_start_stop_background_loop_is_idempotent_and_clean():
     gate, load = make_gate(
         load_workers={1: 100},
-        config=TaperConfig(load_threshold=32.0, reconcile_interval_seconds=0.02),
+        config=TaperConfig(load_threshold=32.0, reconcile_interval_seconds=0.02,
+                            shadow_mode=False),
     )
     gate.start()
     gate.start()  # no-op second call, mirrors ThunderAgentScheduler.start()
