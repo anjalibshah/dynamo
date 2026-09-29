@@ -126,7 +126,7 @@ class TaperGate:
                 task.protected_admitted = True
                 task.admitted_total += 1
                 self._stat_protected_admitted += 1
-                logger.debug("taper.admit path=protected task=%s", task_id)
+                logger.info("taper.admit path=protected task=%s", task_id)
                 return GateDecision(task_id=task_id, request_id=request_id,
                                      admitted=True, protected=True)
 
