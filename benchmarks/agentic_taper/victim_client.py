@@ -274,7 +274,9 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Fire real interactive victim traffic alongside a live Harbor/Pi run.")
     p.add_argument("--base-url", required=True,
-                    help="e.g. http://<host>:8100/v1 -- same DYNAMO_BASE_URL Harbor uses")
+                    help="e.g. http://<host>:8100 -- do NOT include /v1; "
+                    "--path already defaults to /v1/chat/completions, so "
+                    "including it here doubles up and 404s")
     p.add_argument("--model", required=True, help="e.g. dynamo/MiniMaxAI/MiniMax-M2")
     p.add_argument("--path", default="/v1/chat/completions")
     p.add_argument("--out", required=True, help="output JSONL path")
