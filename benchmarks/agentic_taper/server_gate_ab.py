@@ -181,6 +181,108 @@ def _table(a: argparse.Namespace) -> None:
         print(" | ".join(cells))
 
 
+def _tasks(records: list[dict], skip_first_s: float) -> tuple[list[dict], list[dict]]:
+    """Split steady-state tasks into (victims, agentic).
+
+    victim: {"ok", "ttft", "itl"}; agentic: {"ok", "ttj_s"} where ttj_s is the
+    task's time-to-join: root arrival -> join completion. A task is kept only
+    if its first request arrived after the skip window.
+    """
+    if not records:
+        return [], []
+    t0 = min(r["t_arrival"] for r in records)
+    by_task: dict[str, list[dict]] = {}
+    for r in records:
+        by_task.setdefault(r["task_id"], []).append(r)
+    victims, agentic = [], []
+    for reqs in by_task.values():
+        if min(r["t_arrival"] for r in reqs) - t0 < skip_first_s:
+            continue
+        roles = {r["role"]: r for r in reqs}
+        if "victim" in roles:
+            v = roles["victim"]
+            victims.append({"ok": v["ok"], "ttft": v["ttft_ms"], "itl": _mean_itl(v)})
+        elif "root" in roles and "join" in roles:
+            agentic.append({"ok": all(r["ok"] for r in reqs),
+                            "ttj_s": roles["join"]["t_done"] - roles["root"]["t_arrival"]})
+    return victims, agentic
+
+
+def _goodput(a: argparse.Namespace) -> None:
+    """Task-level goodput: fraction of tasks meeting their SLO, median across seeds.
+
+    Victim tasks: TTFT <= --victim-ttft-ms AND mean ITL <= the ITL SLO.
+    Agentic tasks: time-to-join (root arrival -> join done) <= the task
+    deadline. Unlike replay_client.task_goodput (mean ITL only), this charges
+    the gate for the queueing delay it imposes on deferred branches and joins.
+    """
+    runs: dict[str, list[tuple[list[dict], list[dict], list[dict]]]] = {}
+    for path in a.files:
+        meta, recs = _load(path)
+        v, g = _tasks(recs, a.skip_first_s)
+        runs.setdefault(meta.get("label", path), []).append((v, g, recs))
+
+    def med(vals: list[float]) -> str:
+        return (f"{statistics.median(vals):.2f} [{min(vals):.2f}-{max(vals):.2f}]"
+                if vals else "-")
+
+    itl_slos = [float(x) for x in a.victim_itl_ms.split(",")]
+    deadlines = [float(x) for x in a.task_deadline_s.split(",")]
+    print(f"steady state (skip first {a.skip_first_s:g}s); median across seeds [min-max]\n")
+
+    print("agentic time-to-join (s), p50 / p95:")
+    for label, rs in runs.items():
+        p50 = [_pct([t["ttj_s"] for t in g], 0.5) for _, g, _ in rs if g]
+        p95 = [_pct([t["ttj_s"] for t in g], 0.95) for _, g, _ in rs if g]
+        print(f"  {label:<14} {med(p50)} / {med(p95)}")
+
+    print(f"\nvictim goodput (TTFT <= {a.victim_ttft_ms:g} ms and mean ITL <= SLO):")
+    print("  " + " | ".join(["config"] + [f"ITL<={s:g}ms" for s in itl_slos]))
+    for label, rs in runs.items():
+        cells = []
+        for slo in itl_slos:
+            fr = [sum(1 for t in v if t["ok"] and t["ttft"] <= a.victim_ttft_ms
+                      and 0 < t["itl"] <= slo) / len(v) for v, _, _ in rs if v]
+            cells.append(med(fr))
+        print("  " + " | ".join([label] + cells))
+
+    print("\nagentic task goodput (time-to-join <= deadline):")
+    print("  " + " | ".join(["config"] + [f"<={d:g}s" for d in deadlines]))
+    for label, rs in runs.items():
+        cells = []
+        for d in deadlines:
+            fr = [sum(1 for t in g if t["ok"] and t["ttj_s"] <= d) / len(g)
+                  for _, g, _ in rs if g]
+            cells.append(med(fr))
+        print("  " + " | ".join([label] + cells))
+
+    s_itl, s_dl = a.primary_itl_ms, a.primary_deadline_s
+    print(f"\noverall task goodput, all tasks (victim: TTFT<={a.victim_ttft_ms:g}ms & "
+          f"ITL<={s_itl:g}ms; agentic: time-to-join<={s_dl:g}s), and ITL-only "
+          f"task goodput as in replay_client.task_goodput (ITL<={s_itl:g}ms):")
+    for label, rs in runs.items():
+        overall, itl_only = [], []
+        for v, g, recs in rs:
+            good = (sum(1 for t in v if t["ok"] and t["ttft"] <= a.victim_ttft_ms
+                        and 0 < t["itl"] <= s_itl)
+                    + sum(1 for t in g if t["ok"] and t["ttj_s"] <= s_dl))
+            if v or g:
+                overall.append(good / (len(v) + len(g)))
+            steady = {r["task_id"] for r in _steady(recs, a.skip_first_s)}
+            by_task: dict[str, list[dict]] = {}
+            for r in recs:
+                if r["task_id"] in steady:
+                    by_task.setdefault(r["task_id"], []).append(r)
+            if by_task:
+                ok = 0
+                for reqs in by_task.values():
+                    itls = [x for r in reqs for x in (r.get("itls_ms") or [])]
+                    if all(r["ok"] for r in reqs) and (not itls or statistics.mean(itls) <= s_itl):
+                        ok += 1
+                itl_only.append(ok / len(by_task))
+        print(f"  {label:<14} overall {med(overall)}   ITL-only {med(itl_only)}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -209,13 +311,25 @@ def main() -> None:
     t = sub.add_parser("table", help="median-across-seeds table for a sweep")
     t.add_argument("files", nargs="+")
     t.add_argument("--skip-first-s", type=float, default=1.0)
+    gp = sub.add_parser("goodput", help="task-level goodput across SLOs for a sweep")
+    gp.add_argument("files", nargs="+")
+    gp.add_argument("--skip-first-s", type=float, default=1.0)
+    gp.add_argument("--victim-ttft-ms", type=float, default=500.0)
+    gp.add_argument("--victim-itl-ms", default="10,15,25,50",
+                    help="comma-separated victim ITL SLOs (ms)")
+    gp.add_argument("--task-deadline-s", default="5,10,15,30",
+                    help="comma-separated agentic time-to-join deadlines (s)")
+    gp.add_argument("--primary-itl-ms", type=float, default=15.0)
+    gp.add_argument("--primary-deadline-s", type=float, default=10.0)
     a = p.parse_args()
     if a.cmd == "run":
         asyncio.run(_run(a))
     elif a.cmd == "compare":
         _compare(a)
-    else:
+    elif a.cmd == "table":
         _table(a)
+    else:
+        _goodput(a)
 
 
 if __name__ == "__main__":
