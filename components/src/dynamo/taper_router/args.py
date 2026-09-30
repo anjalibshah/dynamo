@@ -26,6 +26,8 @@ class TaperRouterConfig(DynamoRouterConfig):
     reconcile_interval_seconds: float
     defer_timeout_seconds: float
     shadow_mode: bool
+    admit_settle_seconds: float
+    max_release_per_tick: int
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -37,12 +39,18 @@ class TaperRouterConfig(DynamoRouterConfig):
             reconcile_interval_seconds=self.reconcile_interval_seconds,
             defer_timeout_seconds=self.defer_timeout_seconds,
             shadow_mode=self.shadow_mode,
+            admit_settle_seconds=self.admit_settle_seconds,
+            max_release_per_tick=self.max_release_per_tick,
         )
 
     def validate(self) -> None:  # type: ignore[override]
         super().validate()
         if self.load_threshold <= 0:
             raise ValueError("--load-threshold must be > 0")
+        if self.admit_settle_seconds < 0:
+            raise ValueError("--admit-settle-seconds must be >= 0")
+        if self.max_release_per_tick < 1:
+            raise ValueError("--max-release-per-tick must be >= 1")
         if self.reconcile_interval_seconds <= 0:
             raise ValueError("--reconcile-interval-seconds must be > 0")
         if self.defer_timeout_seconds <= 0:
@@ -89,6 +97,25 @@ class TaperArgGroup(ArgGroup):
             "forced admit, so a starved sibling can't wait forever if load "
             "never drops (default: 300.0).",
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--admit-settle-seconds",
+            env_var="DYN_TAPER_ADMIT_SETTLE_SECONDS",
+            default=0.5,
+            help="Count each branch admission as extra load for this long, "
+            "covering the lag before it shows up in forward-pass metrics "
+            "(default: 0.5).",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--max-release-per-tick",
+            env_var="DYN_TAPER_MAX_RELEASE_PER_TICK",
+            default=4,
+            help="Most deferred branches released per reconcile tick, so a "
+            "backlog drains gradually instead of in one burst (default: 4).",
+            arg_type=int,
         )
         add_negatable_bool_argument(
             g,
