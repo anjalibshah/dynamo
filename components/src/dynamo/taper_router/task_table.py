@@ -32,10 +32,13 @@ from typing import Optional
 class AgentTaskState:
     task_id: str
 
-    # The one request per task that always runs (brief: "protected width").
-    # Set once the first branch for this task is admitted; stays set for the
-    # task's lifetime so later branches of the same task are all opportunistic.
-    protected_admitted: bool = False
+    # Trunk requests (the task's own session, no child session) admitted so
+    # far. Trunk requests are always admitted -- the brief's "protected
+    # width" -- and are identified per request from its session headers, not
+    # by arrival order: when a root and its siblings arrive together, "first
+    # request wins" let a branch take the protected slot and deferred the
+    # root, the task's actual critical path.
+    protected_total: int = 0
 
     # Opportunistic siblings currently in flight (admitted but not yet
     # completed). Decremented on completion/abort, not on defer.
