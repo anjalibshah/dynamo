@@ -40,7 +40,10 @@ wait_for() {  # wait_for <seconds> <command...>
         sleep 3
     done
 }
-model_ready() { curl -fsS "$URL/v1/models" 2>/dev/null | grep -q "\"$MODEL\""; }
+# The launch script prints this only once the worker is registered AND the
+# public model is listed. Polling /v1/models alone is not enough in the taper
+# arm: taper_router registers the public name before its worker is up.
+stack_ready() { grep -q "smoketest stack ready" "$REPO/sweep_logs/$name.log" 2>/dev/null; }
 gpu_idle() { [[ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; }
 port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 
@@ -55,11 +58,12 @@ for cfg in $CONFIGS; do
         name="${cfg}__s${seed}"
         if [[ -s "$OUT/$name.jsonl" ]]; then echo "skip $name (done)"; continue; fi
         echo "=== $name ==="
-        cid=$(podman run -d --rm --network host --device nvidia.com/gpu=all \
+        rm -f "$REPO/sweep_logs/$name.log"   # a stale "ready" line would skip the wait
+        cid=$(podman run -d --rm --init --network host --device nvidia.com/gpu=all \
             -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
             -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 "${envs[@]}" "$IMAGE" \
             bash -c "cd /workspace && ./components/src/dynamo/taper_router/run_smoketest_1gpu.sh $policy > /workspace/sweep_logs/$name.log 2>&1")
-        if ! wait_for 600 model_ready; then
+        if ! wait_for 600 stack_ready; then
             echo "stack for $name never became ready; see $REPO/sweep_logs/$name.log" >&2
             podman stop -t 10 "$cid" >/dev/null || true
             exit 1
@@ -67,7 +71,9 @@ for cfg in $CONFIGS; do
         sleep 5
         python3 server_gate_ab.py run --label "$cfg" --seed "$seed" --base-url "$URL" \
             --model "$MODEL" --out "$OUT/$name.jsonl" \
-            --frontend-log "$REPO/sweep_logs/$name.log" | tail -6
+            --frontend-log "$REPO/sweep_logs/$name.log" || {
+            podman stop -t 10 "$cid" >/dev/null || true
+            echo "run $name failed; stopping the sweep" >&2; exit 1; }
         podman stop -t 10 "$cid" >/dev/null || true
         wait_for 120 gpu_idle || { echo "GPU still busy after $name" >&2; exit 1; }
         wait_for 60 port_free || { echo "port 8100 still bound after $name" >&2; exit 1; }
