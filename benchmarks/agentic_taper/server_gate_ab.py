@@ -220,6 +220,15 @@ def _goodput(a: argparse.Namespace) -> None:
     deadline. Unlike replay_client.task_goodput (mean ITL only), this charges
     the gate for the queueing delay it imposes on deferred branches and joins.
     """
+    if a.unloaded_itl_ms is not None or a.unloaded_task_s is not None:
+        # SLO rule (NEXT_STEPS §7.3d): interactive ITL <= factor x unloaded ITL,
+        # agentic completion <= factor x unloaded task time; TTFT stays absolute.
+        if a.unloaded_itl_ms is not None:
+            a.primary_itl_ms = a.slo_factor * a.unloaded_itl_ms
+        if a.unloaded_task_s is not None:
+            a.primary_deadline_s = a.slo_factor * a.unloaded_task_s
+        print(f"SLO rule: factor {a.slo_factor:g}x -> victim ITL <= {a.primary_itl_ms:.2f} ms, "
+              f"agentic time-to-join <= {a.primary_deadline_s:.2f} s")
     runs: dict[str, list[tuple[list[dict], list[dict], list[dict]]]] = {}
     for path in a.files:
         meta, recs = _load(path)
@@ -327,6 +336,12 @@ def main() -> None:
                     help="comma-separated agentic time-to-join deadlines (s)")
     gp.add_argument("--primary-itl-ms", type=float, default=15.0)
     gp.add_argument("--primary-deadline-s", type=float, default=10.0)
+    gp.add_argument("--slo-factor", type=float, default=2.0,
+                    help="SLO = factor x unloaded value (NEXT_STEPS §7.3d)")
+    gp.add_argument("--unloaded-itl-ms", type=float, default=None,
+                    help="measured unloaded ITL; sets primary ITL SLO = factor x this")
+    gp.add_argument("--unloaded-task-s", type=float, default=None,
+                    help="measured unloaded task time; sets primary deadline = factor x this")
     a = p.parse_args()
     if a.cmd == "run":
         asyncio.run(_run(a))
