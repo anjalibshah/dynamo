@@ -55,7 +55,7 @@ if [[ "$POLICY" == "taper" ]]; then
         --model-path "$MODEL_PATH" \
         --router-block-size "$BLOCK_SIZE" \
         --load-threshold "${DYN_TAPER_LOAD_THRESHOLD:-32}" \
-        --shadow-mode "${DYN_TAPER_SHADOW_MODE:-false}" \
+        $( [[ "${DYN_TAPER_SHADOW_MODE:-false}" == "true" ]] && echo --shadow-mode || echo --no-shadow-mode ) \
         --shared-cache-type none &
     ROUTER_MODE=round-robin
 else
