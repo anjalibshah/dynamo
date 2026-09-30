@@ -193,11 +193,17 @@ class HttpFrontend:
                         # ITL is read from the frontend metrics log post-run, joined
                         # on this id. Client itls are kept only as a fallback.
                         try:
-                            cid = json.loads(data).get("id", "")
-                            record.server_request_id = (
-                                cid[len("cmpl-"):] if cid.startswith("cmpl-") else cid)
-                        except Exception:
-                            pass
+                            obj = json.loads(data)
+                        except ValueError:
+                            obj = {}
+                        if isinstance(obj, dict) and "error" in obj:
+                            # An error streamed after a 200: the HTTP call
+                            # succeeded but the request didn't. Surface it
+                            # instead of timing it as a one-token response.
+                            raise RuntimeError(f"stream error: {str(obj['error'])[:300]}")
+                        cid = obj.get("id", "") if isinstance(obj, dict) else ""
+                        record.server_request_id = (
+                            cid[len("cmpl-"):] if cid.startswith("cmpl-") else cid)
                     elif last is not None:
                         record.itls_ms.append((now - last) * 1000.0)
                     last = now

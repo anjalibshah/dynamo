@@ -21,6 +21,7 @@ import asyncio
 import json
 import statistics
 import time
+from collections import Counter
 from dataclasses import asdict
 
 from replay_client import (Arm, HttpFrontend, ReplayEngine, apply_server_metrics,
@@ -91,6 +92,9 @@ async def _run(a: argparse.Namespace) -> None:
     records = await eng.run()
     wall = time.monotonic() - t0
     await frontend.close()
+    errors = Counter(r.error for r in records if not r.ok)
+    for msg, n in errors.most_common(3):
+        print(f"FAILED x{n}: {msg}")
     if a.frontend_log:
         await asyncio.sleep(1.0)
         matched = apply_server_metrics(records, parse_frontend_metrics(a.frontend_log))
