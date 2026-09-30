@@ -9,7 +9,7 @@ import argparse
 from typing import Optional
 
 from dynamo.common.configuration.arg_group import ArgGroup
-from dynamo.common.configuration.utils import add_argument
+from dynamo.common.configuration.utils import add_argument, add_negatable_bool_argument
 from dynamo.router.args import (
     DynamoRouterArgGroup,
     DynamoRouterConfig,
@@ -90,16 +90,16 @@ class TaperArgGroup(ArgGroup):
             "never drops (default: 300.0).",
             arg_type=float,
         )
-        add_argument(
+        add_negatable_bool_argument(
             g,
             flag_name="--shadow-mode",
             env_var="DYN_TAPER_SHADOW_MODE",
             default=True,
             help="P0-4: compute the real admit/defer decision and emit it as "
             "a counter, but always actually admit -- proves the decision "
-            "logic on real traffic with zero behavioral risk. Set to false "
-            "(--no-shadow-mode) to flip on live gating (default: true).",
-            arg_type=bool,
+            "logic on real traffic with zero behavioral risk. Use "
+            "--no-shadow-mode (or DYN_TAPER_SHADOW_MODE=false) to flip on "
+            "live gating (default: true).",
         )
         add_argument(
             g,
