@@ -95,6 +95,14 @@ async def _run(a: argparse.Namespace) -> None:
         await asyncio.sleep(1.0)
         matched = apply_server_metrics(records, parse_frontend_metrics(a.frontend_log))
         print(f"server-metrics matched {matched}/{len(records)} requests")
+        if matched < 0.9 * len(records):
+            # Unmatched requests didn't complete normally on the server (e.g. the
+            # stack wasn't ready and each stream ended with an error chunk, which
+            # the client still counts as ok). Fail loudly instead of writing a
+            # plausible-looking result.
+            raise SystemExit(
+                f"ERROR: only {matched}/{len(records)} requests completed on the "
+                f"server; not writing {a.out}. Check {a.frontend_log}.")
     dicts = [asdict(r) | {"label": a.label} for r in records]
     with open(a.out, "w") as f:
         f.write(json.dumps({"_meta": vars(a) | {"wall_s": wall}}) + "\n")
