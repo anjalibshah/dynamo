@@ -30,7 +30,8 @@ SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 if curl -fsS "$URL/v1/models" >/dev/null 2>&1; then
     echo "something is already serving on $URL; stop it first" >&2; exit 2
 fi
-mkdir -p "$OUT" "$REPO/sweep_logs"
+mkdir -p "$OUT" "$REPO/sweep_logs" "$HF"
+echo "HF cache: $HF (set HF_HOME to override; a new location means a model download)"
 
 wait_for() {  # wait_for <seconds> <command...>
     local deadline=$((SECONDS + $1)); shift
