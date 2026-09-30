@@ -29,6 +29,14 @@ MODEL_NAME_ROUTER="${MODEL_NAME_ROUTER:-Qwen2.5-1.5B-Instruct}"
 WORKER_MODEL="$MODEL_NAME_ROUTER"
 BLOCK_SIZE=16
 HTTP_PORT=8100
+# Pilot knobs (defaults keep the original 1-GPU Qwen smoke test):
+#   TP=1 GPUS=0 TOOL_PARSER= REASONING_PARSER=  (e.g. glm47 / glm45 for GLM-4.7-Flash)
+#   DYN_REQUEST_TRACE=1 DYN_REQUEST_TRACE_OUTPUT_PATH=...  records session/parent ids
+TP="${TP:-1}"
+GPUS="${GPUS:-0}"
+PARSER_ARGS=()
+[[ -n "${TOOL_PARSER:-}" ]] && PARSER_ARGS+=(--dyn-tool-call-parser "$TOOL_PARSER")
+[[ -n "${REASONING_PARSER:-}" ]] && PARSER_ARGS+=(--dyn-reasoning-parser "$REASONING_PARSER")
 
 if [[ "$POLICY" == "taper" || "$POLICY" == "ta" ]]; then
     WORKER_MODEL="dyn-internal-smoketest"
@@ -42,18 +50,18 @@ export DYN_EVENT_PLANE=zmq
 mkdir -p "$DYN_FILE_KV"
 
 DYN_SYSTEM_PORT=8181 DYN_FORWARDPASS_METRIC_PORT=20081 \
-VLLM_NIXL_SIDE_CHANNEL_PORT=20097 CUDA_VISIBLE_DEVICES=0 \
+VLLM_NIXL_SIDE_CHANNEL_PORT=20097 CUDA_VISIBLE_DEVICES="$GPUS" \
 python -m dynamo.vllm \
     --model "$MODEL_PATH" --served-model-name "$WORKER_MODEL" \
-    --tensor-parallel-size 1 --block-size "$BLOCK_SIZE" \
-    --enable-prefix-caching \
+    --tensor-parallel-size "$TP" --block-size "$BLOCK_SIZE" \
+    --enable-prefix-caching ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' &
 
 if [[ "$POLICY" == "taper" ]]; then
     DYN_SYSTEM_PORT=8183 python -m dynamo.taper_router \
         --endpoint dynamo.backend.generate \
         --model-name "$MODEL_NAME_ROUTER" \
-        --model-path "$MODEL_PATH" \
+        --model-path "$MODEL_PATH" ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
         --router-block-size "$BLOCK_SIZE" \
         --load-threshold "${DYN_TAPER_LOAD_THRESHOLD:-32}" \
         $( [[ "${DYN_TAPER_SHADOW_MODE:-false}" == "true" ]] && echo --shadow-mode || echo --no-shadow-mode ) \
@@ -63,7 +71,7 @@ elif [[ "$POLICY" == "ta" ]]; then
     DYN_SYSTEM_PORT=8183 python -m dynamo.thunderagent_router \
         --endpoint dynamo.backend.generate \
         --model-name "$MODEL_NAME_ROUTER" \
-        --model-path "$MODEL_PATH" \
+        --model-path "$MODEL_PATH" ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
         --router-block-size "$BLOCK_SIZE" \
         --shared-cache-type none &
     ROUTER_MODE=round-robin
@@ -75,6 +83,7 @@ DYN_SYSTEM_PORT=8184 python -m dynamo.frontend \
     --http-host 0.0.0.0 \
     --http-port "$HTTP_PORT" \
     --router-mode "$ROUTER_MODE" \
+    --enable-anthropic-api \
     --shared-cache-type none &
 
 until curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models/${WORKER_MODEL}/ready" 2>/dev/null \
