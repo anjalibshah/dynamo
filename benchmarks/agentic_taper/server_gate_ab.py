@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import statistics
 import time
 from dataclasses import asdict
 
@@ -37,6 +38,16 @@ def _pct(vals: list[float], q: float) -> float:
 def _mean_itl(r: dict) -> float:
     itls = r.get("itls_ms") or []
     return sum(itls) / len(itls) if itls else 0.0
+
+
+def _steady(records: list[dict], skip_first_s: float) -> list[dict]:
+    # The trace opens with a burst into a cold engine and an empty prefix
+    # cache, before the gate has any FPM reading; every arm's slowest victims
+    # land in the first ~0.6 s. Drop that window to compare steady state.
+    if not skip_first_s or not records:
+        return records
+    t0 = min(r["t_arrival"] for r in records)
+    return [r for r in records if r["t_arrival"] - t0 >= skip_first_s]
 
 
 def _summary(records: list[dict]) -> dict:
@@ -111,6 +122,9 @@ def _compare(a: argparse.Namespace) -> None:
     for m in ("seed", "n_tasks", "fanout_k", "burst", "victim_frac", "prefix_blocks"):
         if ma.get(m) != mb.get(m):
             print(f"WARNING: runs differ in {m}: {ma.get(m)} vs {mb.get(m)} (not paired)")
+    if a.skip_first_s:
+        ra, rb = _steady(ra, a.skip_first_s), _steady(rb, a.skip_first_s)
+        print(f"(steady state: excluding requests that arrived in the first {a.skip_first_s:g}s)")
     sa, sb = _summary(ra), _summary(rb)
     _print_summary(la, sa)
     _print_summary(lb, sb)
@@ -130,6 +144,29 @@ def _compare(a: argparse.Namespace) -> None:
               f"p50={_pct(deltas, 0.5):+.2f} ms  p95={_pct(deltas, 0.95):+.2f} ms")
     for lbl, m in ((la, ma), (lb, mb)):
         print(f"  {lbl} wall time {m.get('wall_s', 0):.1f}s")
+
+
+def _table(a: argparse.Namespace) -> None:
+    """Median across seeds per config label, steady state; (min-max) spread."""
+    runs: dict[str, list[tuple[dict, dict]]] = {}
+    for path in a.files:
+        meta, recs = _load(path)
+        runs.setdefault(meta.get("label", path), []).append(
+            (meta, _summary(_steady(recs, a.skip_first_s))))
+    cols = [("victim", "itl_p50"), ("victim", "itl_p95"), ("victim", "ttft_p50"),
+            ("victim", "ttft_p95"), ("root", "ttft_p50"), ("branch", "ttft_p50")]
+    head = ["config", "runs"] + [f"{r}.{k}" for r, k in cols] + ["wall_s"]
+    print(f"steady state (skip first {a.skip_first_s:g}s); median across runs, [min-max]")
+    print(" | ".join(head))
+    for label, rs in runs.items():
+        cells = [label, str(len(rs))]
+        for role, key in cols:
+            vals = [s[role][key] for _, s in rs if role in s]
+            cells.append(f"{statistics.median(vals):.1f} [{min(vals):.1f}-{max(vals):.1f}]"
+                         if vals else "-")
+        walls = [m.get("wall_s", 0.0) for m, _ in rs]
+        cells.append(f"{statistics.median(walls):.1f}")
+        print(" | ".join(cells))
 
 
 def main() -> None:
@@ -155,11 +192,18 @@ def main() -> None:
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
+    c.add_argument("--skip-first-s", type=float, default=0.0,
+                   help="exclude requests arriving in the first N seconds (startup burst)")
+    t = sub.add_parser("table", help="median-across-seeds table for a sweep")
+    t.add_argument("files", nargs="+")
+    t.add_argument("--skip-first-s", type=float, default=1.0)
     a = p.parse_args()
     if a.cmd == "run":
         asyncio.run(_run(a))
-    else:
+    elif a.cmd == "compare":
         _compare(a)
+    else:
+        _table(a)
 
 
 if __name__ == "__main__":
