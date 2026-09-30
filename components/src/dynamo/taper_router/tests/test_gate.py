@@ -242,3 +242,80 @@ async def test_start_stop_background_loop_is_idempotent_and_clean():
 
     await gate.stop()
     await gate.stop()  # no-op second call
+
+
+async def _defer_branches(gate, n):
+    futs = [asyncio.ensure_future(gate.before_request("t1", f"t1-branch-{i}", is_trunk=False))
+            for i in range(n)]
+    await asyncio.sleep(0.02)
+    assert not any(f.done() for f in futs)
+    return futs
+
+
+@pytest.mark.asyncio
+async def test_release_is_capped_per_tick():
+    # Regression: one low load reading used to release the whole backlog at
+    # once (observed bursts of 58/30/29), recreating the prefill spike.
+    gate, load = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=32.0, defer_timeout_seconds=5.0,
+                            shadow_mode=False, max_release_per_tick=4),
+    )
+    futs = await _defer_branches(gate, 10)
+    load.workers = {1: 0}
+    await gate._reconcile()
+    await asyncio.sleep(0.01)
+    assert sum(f.done() for f in futs) == 4
+    for f in futs:
+        f.cancel()
+
+
+@pytest.mark.asyncio
+async def test_recent_admits_count_toward_load_until_fpm_catches_up():
+    gate, _ = make_gate(
+        load_workers={1: 0},
+        config=TaperConfig(load_threshold=2.0, defer_timeout_seconds=5.0,
+                            shadow_mode=False, admit_settle_seconds=10.0),
+    )
+    for i in range(3):  # projected load 0, 1, 2 -> all admitted
+        d = await asyncio.wait_for(
+            gate.before_request("t1", f"t1-branch-{i}", is_trunk=False), timeout=1.0)
+        assert d.was_deferred is False
+    fourth = asyncio.ensure_future(gate.before_request("t1", "t1-branch-3", is_trunk=False))
+    await asyncio.sleep(0.02)
+    assert not fourth.done()  # stale FPM still says 0, but 3 admits are in flight
+    fourth.cancel()
+
+
+@pytest.mark.asyncio
+async def test_settled_admits_stop_counting():
+    gate, _ = make_gate(
+        load_workers={1: 0},
+        config=TaperConfig(load_threshold=1.0, defer_timeout_seconds=5.0,
+                            shadow_mode=False, admit_settle_seconds=0.05),
+    )
+    await gate.before_request("t1", "t1-branch-0", is_trunk=False)
+    await gate.before_request("t1", "t1-branch-1", is_trunk=False)
+    third = asyncio.ensure_future(gate.before_request("t1", "t1-branch-2", is_trunk=False))
+    await asyncio.sleep(0.1)  # settle window passes
+    assert not third.done()
+    await gate._reconcile()
+    decision = await asyncio.wait_for(third, timeout=1.0)
+    assert decision.was_deferred is True
+
+
+@pytest.mark.asyncio
+async def test_new_branch_queues_behind_deferred_ones():
+    gate, load = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=32.0, defer_timeout_seconds=5.0,
+                            shadow_mode=False),
+    )
+    first = await _defer_branches(gate, 1)
+    load.workers = {1: 0}  # slack, but no reconcile tick yet
+    second = asyncio.ensure_future(gate.before_request("t1", "t1-branch-9", is_trunk=False))
+    await asyncio.sleep(0.02)
+    assert not second.done()  # doesn't jump ahead of the queued branch
+    await gate._reconcile()
+    assert (await asyncio.wait_for(first[0], timeout=1.0)).was_deferred is True
+    assert (await asyncio.wait_for(second, timeout=1.0)).was_deferred is True

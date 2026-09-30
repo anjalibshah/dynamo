@@ -39,3 +39,12 @@ def test_no_shadow_mode_flag_turns_it_off(monkeypatch):
 def test_shadow_mode_env_var_is_parsed_as_bool(monkeypatch, value, expected):
     monkeypatch.setenv("DYN_TAPER_SHADOW_MODE", value)
     assert _parse([]).shadow_mode is expected
+
+
+def test_release_smoothing_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("DYN_TAPER_ADMIT_SETTLE_SECONDS", raising=False)
+    monkeypatch.delenv("DYN_TAPER_MAX_RELEASE_PER_TICK", raising=False)
+    ns = _parse([])
+    assert (ns.admit_settle_seconds, ns.max_release_per_tick) == (0.5, 4)
+    ns = _parse(["--admit-settle-seconds", "0.25", "--max-release-per-tick", "8"])
+    assert (ns.admit_settle_seconds, ns.max_release_per_tick) == (0.25, 8)

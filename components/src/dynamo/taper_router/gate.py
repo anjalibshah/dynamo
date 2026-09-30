@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -68,6 +69,15 @@ class TaperConfig:
     # actually admit (AdmissionDecision::Ready in the brief's shadow mode).
     # Flip once the shadow counters look sane on real traffic.
     shadow_mode: bool = True
+    # FPM lags admission: a request only counts as a decode request once its
+    # prefill finishes and the next forward pass is published. Each branch
+    # admission is counted as extra load for this long, so one stale low
+    # reading can't admit or release a whole burst.
+    admit_settle_seconds: float = 0.5
+    # Most deferred branches released per reconcile tick. Without a cap, one
+    # low reading drained the backlog at once (58, then 30, then 29 on a
+    # 1-GPU run), recreating the prefill burst the gate exists to prevent.
+    max_release_per_tick: int = 4
 
 
 class TaperGate:
@@ -77,6 +87,8 @@ class TaperGate:
         self._table = TaskTable()
         self._lock = asyncio.Lock()
         self._deferred: list[tuple[str, str, asyncio.Event]] = []  # (task_id, request_id, event)
+        # Monotonic times of recent branch admissions, not yet visible in FPM.
+        self._recent_admits: deque[float] = deque()
         self._scheduler_task: Optional[asyncio.Task] = None
         self._stat_tasks_created = 0
         self._stat_protected_admitted = 0
@@ -116,6 +128,17 @@ class TaperGate:
             return 0.0
         return float(max(snapshot.values()))
 
+    def _projected_load_locked(self) -> float:
+        # Caller holds self._lock. Conservative: an admission can briefly be
+        # counted both here and in FPM once FPM catches up.
+        cutoff = time.monotonic() - self._cfg.admit_settle_seconds
+        while self._recent_admits and self._recent_admits[0] < cutoff:
+            self._recent_admits.popleft()
+        return self._current_load() + len(self._recent_admits)
+
+    def _record_admit_locked(self) -> None:
+        self._recent_admits.append(time.monotonic())
+
     async def before_request(self, task_id: str, request_id: str, *,
                              is_trunk: bool) -> GateDecision:
         """Admit or defer one request.
@@ -130,17 +153,20 @@ class TaperGate:
             task = self._table.get_or_create(task_id)
             if was_new:
                 self._stat_tasks_created += 1
+                logger.info("taper.task created task=%s", task_id)
             if is_trunk:
                 task.protected_total += 1
                 task.admitted_total += 1
                 self._stat_protected_admitted += 1
-                logger.info("taper.admit path=protected task=%s", task_id)
+                logger.debug("taper.admit path=protected task=%s", task_id)
                 return GateDecision(task_id=task_id, request_id=request_id,
                                      admitted=True, protected=True)
 
-            load = self._current_load()
-            would_defer = load > self._cfg.load_threshold
+            load = self._projected_load_locked()
+            # Queue behind already-deferred branches so release stays FIFO.
+            would_defer = bool(self._deferred) or load > self._cfg.load_threshold
             if not would_defer or self._cfg.shadow_mode:
+                self._record_admit_locked()
                 task.inflight_opportunistic += 1
                 task.admitted_total += 1
                 if would_defer:
@@ -250,8 +276,13 @@ class TaperGate:
             return
         released = 0
         async with self._lock:
-            while self._deferred and self._current_load() <= self._cfg.load_threshold:
+            # Each release is recorded as a recent admit, so projected load
+            # rises as we go; the per-tick cap bounds the burst further.
+            while (self._deferred
+                   and released < self._cfg.max_release_per_tick
+                   and self._projected_load_locked() <= self._cfg.load_threshold):
                 task_id, request_id, event = self._deferred.pop(0)
+                self._record_admit_locked()
                 task = self._table.tasks.get(task_id)
                 if task is not None and request_id in task.deferred_request_ids:
                     task.deferred_request_ids.remove(request_id)
