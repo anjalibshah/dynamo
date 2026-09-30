@@ -10,14 +10,15 @@
 # plumbing). One TP1 worker, a small fast-downloading model. Usage:
 #   ./run_smoketest_1gpu.sh kv     # stock KV router, no gate
 #   ./run_smoketest_1gpu.sh taper  # taper_router gate
+#   ./run_smoketest_1gpu.sh ta     # thunderagent_router (same router-hop design; control)
 set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/../../../../examples/common/launch_utils.sh"
 
 POLICY="${1:-}"
-if [[ "$POLICY" != "kv" && "$POLICY" != "taper" ]]; then
-    echo "usage: $0 kv|taper" >&2
+if [[ "$POLICY" != "kv" && "$POLICY" != "taper" && "$POLICY" != "ta" ]]; then
+    echo "usage: $0 kv|taper|ta" >&2
     exit 2
 fi
 
@@ -29,7 +30,7 @@ WORKER_MODEL="$MODEL_NAME_ROUTER"
 BLOCK_SIZE=16
 HTTP_PORT=8100
 
-if [[ "$POLICY" == "taper" ]]; then
+if [[ "$POLICY" == "taper" || "$POLICY" == "ta" ]]; then
     WORKER_MODEL="dyn-internal-smoketest"
 fi
 
@@ -56,6 +57,14 @@ if [[ "$POLICY" == "taper" ]]; then
         --router-block-size "$BLOCK_SIZE" \
         --load-threshold "${DYN_TAPER_LOAD_THRESHOLD:-32}" \
         $( [[ "${DYN_TAPER_SHADOW_MODE:-false}" == "true" ]] && echo --shadow-mode || echo --no-shadow-mode ) \
+        --shared-cache-type none &
+    ROUTER_MODE=round-robin
+elif [[ "$POLICY" == "ta" ]]; then
+    DYN_SYSTEM_PORT=8183 python -m dynamo.thunderagent_router \
+        --endpoint dynamo.backend.generate \
+        --model-name "$MODEL_NAME_ROUTER" \
+        --model-path "$MODEL_PATH" \
+        --router-block-size "$BLOCK_SIZE" \
         --shared-cache-type none &
     ROUTER_MODE=round-robin
 else

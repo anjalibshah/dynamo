@@ -88,6 +88,10 @@ async def _run(a: argparse.Namespace) -> None:
     eng = ReplayEngine(rows, Arm.A1, a.model, frontend,
                        max_concurrency=a.max_concurrency,
                        words_per_block=a.words_per_block)
+    if a.no_session_headers:
+        # No task identity: taper_router and thunderagent_router both take
+        # their passthrough path, isolating the cost of the router hop itself.
+        eng._headers = lambda row: {}
     t0 = time.monotonic()
     records = await eng.run()
     wall = time.monotonic() - t0
@@ -303,6 +307,8 @@ def main() -> None:
     r.add_argument("--max-concurrency", type=int, default=128)
     r.add_argument("--frontend-log", default=None,
                    help="frontend stdout log; if given, use server-measured TTFT/ITL")
+    r.add_argument("--no-session-headers", action="store_true",
+                   help="omit x-dynamo-session/parent headers (router passthrough path)")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")

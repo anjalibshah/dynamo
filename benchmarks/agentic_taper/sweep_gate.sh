@@ -12,6 +12,7 @@
 # active, after `source ~/.bashrc`, with nothing else on port 8100:
 #   ./sweep_gate.sh
 #   CONFIGS="taper-shadow taper-t32" SEEDS="0 1" ./sweep_gate.sh
+#   CONFIGS="ta-pass taper-pass" ./sweep_gate.sh     # router-hop cost controls
 # Then:
 #   python3 server_gate_ab.py table "$OUT"/*.jsonl
 set -euo pipefail
@@ -49,9 +50,12 @@ port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 
 for cfg in $CONFIGS; do
     case "$cfg" in
-        kv)            policy=kv;    envs=() ;;
-        taper-shadow)  policy=taper; envs=(-e DYN_TAPER_SHADOW_MODE=true) ;;
-        taper-t*)      policy=taper; envs=(-e "DYN_TAPER_LOAD_THRESHOLD=${cfg#taper-t}") ;;
+        kv)            policy=kv;    envs=(); drv=() ;;
+        taper-shadow)  policy=taper; envs=(-e DYN_TAPER_SHADOW_MODE=true); drv=() ;;
+        taper-t*)      policy=taper; envs=(-e "DYN_TAPER_LOAD_THRESHOLD=${cfg#taper-t}"); drv=() ;;
+        # router-hop controls: no session headers -> passthrough path, no gate
+        taper-pass)    policy=taper; envs=(); drv=(--no-session-headers) ;;
+        ta-pass)       policy=ta;    envs=(); drv=(--no-session-headers) ;;
         *) echo "unknown config $cfg" >&2; exit 2 ;;
     esac
     for seed in $SEEDS; do
@@ -71,7 +75,7 @@ for cfg in $CONFIGS; do
         sleep 5
         python3 server_gate_ab.py run --label "$cfg" --seed "$seed" --base-url "$URL" \
             --model "$MODEL" --out "$OUT/$name.jsonl" \
-            --frontend-log "$REPO/sweep_logs/$name.log" || {
+            --frontend-log "$REPO/sweep_logs/$name.log" ${drv[@]+"${drv[@]}"} || {
             podman stop -t 10 "$cid" >/dev/null || true
             echo "run $name failed; stopping the sweep" >&2; exit 1; }
         podman stop -t 10 "$cid" >/dev/null || true
