@@ -3,7 +3,8 @@
 
 """Agentic TAPER admission gate: native port of the brief's Appendix C sketch.
 
-Guarantee one protected request per task; admit opportunistic siblings only
+Always admit a task's trunk (its own session: root turns, joins); admit
+opportunistic branch siblings only
 while live decode load is at or below ``load_threshold``; defer the rest and
 release them FIFO as load drops. This is the P0-2/P0-3/P0-4/P0-5 sequence from
 the brief collapsed into one Python module, following the same
@@ -115,15 +116,22 @@ class TaperGate:
             return 0.0
         return float(max(snapshot.values()))
 
-    async def before_request(self, task_id: str, request_id: str) -> GateDecision:
+    async def before_request(self, task_id: str, request_id: str, *,
+                             is_trunk: bool) -> GateDecision:
+        """Admit or defer one request.
+
+        ``is_trunk``: the request belongs to the task's own session (a root
+        turn or a join), not a child branch session. Trunk requests are
+        always admitted; only branch requests are gated.
+        """
         wait_started = time.monotonic()
         async with self._lock:
             was_new = task_id not in self._table.tasks
             task = self._table.get_or_create(task_id)
             if was_new:
                 self._stat_tasks_created += 1
-            if not task.protected_admitted:
-                task.protected_admitted = True
+            if is_trunk:
+                task.protected_total += 1
                 task.admitted_total += 1
                 self._stat_protected_admitted += 1
                 logger.info("taper.admit path=protected task=%s", task_id)
@@ -186,14 +194,14 @@ class TaperGate:
         if task is not None and request_id in task.deferred_request_ids:
             task.deferred_request_ids.remove(request_id)
 
-    async def after_request(self, task_id: str) -> None:
+    async def after_request(self, task_id: str, *, protected: bool) -> None:
         """Release the opportunistic-sibling slot this request held.
 
-        Does not release the *task's* protected slot -- ``protected_admitted``
-        stays set for the task's whole lifetime so later branches of the same
-        task are always treated as opportunistic, matching the brief's "one
-        guaranteed branch per task" (not "one guaranteed branch per burst").
+        Protected (trunk) requests never took a slot, so completing one must
+        not decrement the task's in-flight opportunistic count.
         """
+        if protected:
+            return
         async with self._lock:
             task = self._table.tasks.get(task_id)
             if task is not None and task.inflight_opportunistic > 0:
@@ -267,7 +275,7 @@ class TaperGate:
                 "tasks": [
                     {
                         "task_id": t.task_id,
-                        "protected_admitted": t.protected_admitted,
+                        "protected_total": t.protected_total,
                         "inflight_opportunistic": t.inflight_opportunistic,
                         "deferred": len(t.deferred_request_ids),
                         "admitted_total": t.admitted_total,

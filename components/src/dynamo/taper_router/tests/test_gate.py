@@ -45,27 +45,62 @@ def make_gate(
 
 
 @pytest.mark.asyncio
-async def test_first_branch_of_a_task_is_always_protected():
+async def test_trunk_request_is_protected():
     gate, _ = make_gate()
-    decision = await gate.before_request("t1", "t1-root")
+    decision = await gate.before_request("t1", "t1-root", is_trunk=True)
     assert decision.protected is True
     assert decision.admitted is True
     assert decision.was_deferred is False
 
 
 @pytest.mark.asyncio
-async def test_second_branch_is_opportunistic_not_protected():
+async def test_branch_request_is_opportunistic():
     gate, _ = make_gate()
-    await gate.before_request("t1", "t1-root")
-    decision = await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    decision = await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     assert decision.protected is False
+
+
+@pytest.mark.asyncio
+async def test_branch_arriving_before_root_does_not_take_protected_slot():
+    # Regression: protection used to go to whichever request of a task arrived
+    # first. With simultaneous fan-out a branch often beat the root, and the
+    # root -- the task's critical path -- got deferred under load.
+    gate, _ = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=32.0, defer_timeout_seconds=5.0,
+                            shadow_mode=False),
+    )
+    branch = asyncio.ensure_future(gate.before_request("t1", "t1-branch-0", is_trunk=False))
+    await asyncio.sleep(0.02)
+    assert not branch.done()  # branch deferred even though it arrived first
+
+    root = await asyncio.wait_for(
+        gate.before_request("t1", "t1-root", is_trunk=True), timeout=1.0)
+    assert root.protected is True
+    assert root.was_deferred is False
+    branch.cancel()
+
+
+@pytest.mark.asyncio
+async def test_every_trunk_turn_is_protected_under_load():
+    gate, _ = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=32.0, shadow_mode=False),
+    )
+    for turn in range(3):
+        decision = await asyncio.wait_for(
+            gate.before_request("t1", "t1-root", is_trunk=True), timeout=1.0)
+        assert decision.protected is True
+        await gate.after_request("t1", protected=True)
+    assert gate._table.tasks["t1"].protected_total == 3
 
 
 @pytest.mark.asyncio
 async def test_opportunistic_branch_admitted_immediately_under_threshold():
     gate, load = make_gate(load_workers={1: 5}, config=TaperConfig(load_threshold=32.0))
-    await gate.before_request("t1", "t1-root")
-    decision = await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    decision = await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     assert decision.admitted is True
     assert decision.was_deferred is False
 
@@ -79,9 +114,9 @@ async def test_opportunistic_branch_deferred_over_threshold_then_released_on_rec
             defer_timeout_seconds=5.0, shadow_mode=False,
         ),
     )
-    await gate.before_request("t1", "t1-root")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
 
-    task = asyncio.ensure_future(gate.before_request("t1", "t1-branch-0"))
+    task = asyncio.ensure_future(gate.before_request("t1", "t1-branch-0", is_trunk=False))
     await asyncio.sleep(0.05)
     assert not task.done()  # still deferred: load is over threshold
 
@@ -102,8 +137,8 @@ async def test_deferred_branch_force_admitted_after_timeout():
             defer_timeout_seconds=0.05, shadow_mode=False,
         ),
     )
-    await gate.before_request("t1", "t1-root")
-    decision = await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    decision = await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     assert decision.admitted is True
     assert decision.was_deferred is True
     assert gate._stat_forced_admits == 1
@@ -115,8 +150,8 @@ async def test_shadow_mode_always_admits_but_records_would_defer():
         load_workers={1: 100},
         config=TaperConfig(load_threshold=32.0, shadow_mode=True),
     )
-    await gate.before_request("t1", "t1-root")
-    decision = await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    decision = await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     assert decision.admitted is True
     assert decision.was_deferred is False
     assert decision.shadow_would_defer is True
@@ -127,24 +162,25 @@ async def test_shadow_mode_always_admits_but_records_would_defer():
 @pytest.mark.asyncio
 async def test_after_request_decrements_opportunistic_count_not_protected_slot():
     gate, _ = make_gate(load_workers={1: 5})
-    await gate.before_request("t1", "t1-root")
-    await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     task = gate._table.tasks["t1"]
     assert task.inflight_opportunistic == 1
 
-    await gate.after_request("t1")
+    # A trunk completing must not release a branch's opportunistic slot.
+    await gate.after_request("t1", protected=True)
+    assert task.inflight_opportunistic == 1
+
+    await gate.after_request("t1", protected=False)
     assert task.inflight_opportunistic == 0
-    # protected_admitted stays set for the task's whole lifetime -- the next
-    # branch of the same task is still opportunistic, not re-protected.
-    assert task.protected_admitted is True
-    decision = await gate.before_request("t1", "t1-branch-1")
+    decision = await gate.before_request("t1", "t1-branch-1", is_trunk=False)
     assert decision.protected is False
 
 
 @pytest.mark.asyncio
 async def test_end_task_drops_bookkeeping():
     gate, _ = make_gate()
-    await gate.before_request("t1", "t1-root")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
     assert gate.end_task("t1") is True
     assert "t1" not in gate._table.tasks
     assert gate.end_task("t1") is False
@@ -153,8 +189,8 @@ async def test_end_task_drops_bookkeeping():
 @pytest.mark.asyncio
 async def test_cold_start_with_no_load_signal_fails_open():
     gate, _ = make_gate(load_workers={})  # no FPM observed yet
-    await gate.before_request("t1", "t1-root")
-    decision = await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    decision = await gate.before_request("t1", "t1-branch-0", is_trunk=False)
     assert decision.admitted is True
     assert decision.was_deferred is False
 
@@ -162,22 +198,22 @@ async def test_cold_start_with_no_load_signal_fails_open():
 @pytest.mark.asyncio
 async def test_status_snapshot_reports_tasks_and_load():
     gate, _ = make_gate(load_workers={1: 5, 2: 9})
-    await gate.before_request("t1", "t1-root")
-    await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    await gate.before_request("t1", "t1-branch-0", is_trunk=False)
 
     snapshot = await gate.status_snapshot()
     assert snapshot["tasks_total"] == 1
     assert snapshot["load"] == 9  # max across workers
     assert snapshot["tasks"][0]["task_id"] == "t1"
-    assert snapshot["tasks"][0]["protected_admitted"] is True
+    assert snapshot["tasks"][0]["protected_total"] == 1
     assert snapshot["tasks"][0]["inflight_opportunistic"] == 1
 
 
 @pytest.mark.asyncio
 async def test_metrics_snapshot_counters():
     gate, _ = make_gate(load_workers={1: 5})
-    await gate.before_request("t1", "t1-root")
-    await gate.before_request("t1", "t1-branch-0")
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    await gate.before_request("t1", "t1-branch-0", is_trunk=False)
 
     metrics = await gate.metrics_snapshot()
     assert metrics["counters"]["tasks_created_total"] == 1
@@ -196,8 +232,8 @@ async def test_start_stop_background_loop_is_idempotent_and_clean():
     gate.start()
     gate.start()  # no-op second call, mirrors ThunderAgentScheduler.start()
 
-    await gate.before_request("t1", "t1-root")
-    deferred = asyncio.ensure_future(gate.before_request("t1", "t1-branch-0"))
+    await gate.before_request("t1", "t1-root", is_trunk=True)
+    deferred = asyncio.ensure_future(gate.before_request("t1", "t1-branch-0", is_trunk=False))
     await asyncio.sleep(0.05)
     load.workers = {1: 1}
 

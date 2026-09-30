@@ -16,7 +16,7 @@ def test_get_or_create_creates_new_task():
     table = TaskTable()
     task = table.get_or_create("t1")
     assert task.task_id == "t1"
-    assert task.protected_admitted is False
+    assert task.protected_total == 0
     assert task.inflight_opportunistic == 0
     assert task.deferred_request_ids == []
     assert table.tasks["t1"] is task
@@ -33,8 +33,8 @@ def test_get_or_create_tracks_independent_tasks():
     table = TaskTable()
     a = table.get_or_create("a")
     b = table.get_or_create("b")
-    a.protected_admitted = True
-    assert b.protected_admitted is False
+    a.protected_total = 3
+    assert b.protected_total == 0
     assert set(table.tasks) == {"a", "b"}
 
 

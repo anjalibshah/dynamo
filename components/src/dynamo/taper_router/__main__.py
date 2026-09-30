@@ -51,8 +51,10 @@ configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
 
-def _extract_task_and_request_id(request: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """(task_id, request_id) from agent_context, or (None, None) if absent.
+def _extract_task_identity(
+    request: dict[str, Any],
+) -> tuple[Optional[str], Optional[str], bool]:
+    """(task_id, request_id, is_trunk) from agent_context; (None, None, False) if absent.
 
     task_id is the root task's session_id: ``parent_session_id`` when present
     (a branch/join of a fanned-out task), else the request's own
@@ -60,16 +62,21 @@ def _extract_task_and_request_id(request: dict[str, Any]) -> tuple[Optional[str]
     Appendix B: task == "no native concept; approximated by the root
     session_id"). request_id is the request's own session_id, since branches
     already carry a distinct id per the brief's P0 identity workaround.
+
+    is_trunk: the request runs in the task's own session (session_id ==
+    task_id) -- a root turn, or a join that reuses the root's session -- as
+    opposed to a child branch session. Trunk requests are the task's
+    critical path and are never gated.
     """
     ctx = request.get("agent_context")
     if not isinstance(ctx, dict):
-        return None, None
+        return None, None, False
     session_id = ctx.get("session_id")
     if not isinstance(session_id, str) or not session_id:
-        return None, None
+        return None, None, False
     parent_id = ctx.get("parent_session_id")
     task_id = parent_id if isinstance(parent_id, str) and parent_id else session_id
-    return task_id, session_id
+    return task_id, session_id, session_id == task_id
 
 
 def _wrap_preprocessed_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -144,7 +151,7 @@ class TaperRouterHandler:
         if self._gate is None or self._kv_router is None:
             raise RuntimeError("TaperRouterHandler used before initialize() was called")
 
-        task_id, request_id = _extract_task_and_request_id(request)
+        task_id, request_id, is_trunk = _extract_task_identity(request)
         self._stat_requests_total += 1
         preprocessed = _wrap_preprocessed_request(request)
 
@@ -159,7 +166,7 @@ class TaperRouterHandler:
             return
 
         self._stat_gated_requests += 1
-        decision = await self._gate.before_request(task_id, request_id)
+        decision = await self._gate.before_request(task_id, request_id, is_trunk=is_trunk)
         logger.debug(
             "taper.route path=gated task=%s request=%s protected=%s "
             "was_deferred=%s waited=%.4fs",
@@ -172,7 +179,7 @@ class TaperRouterHandler:
             ):
                 yield chunk
         finally:
-            await self._gate.after_request(task_id)
+            await self._gate.after_request(task_id, protected=decision.protected)
 
     async def status(self, request: Optional[dict[str, Any]] = None):
         gate_status = await self._gate.status_snapshot() if self._gate is not None else None
