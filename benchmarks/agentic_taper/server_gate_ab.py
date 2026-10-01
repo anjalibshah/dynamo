@@ -24,8 +24,8 @@ import time
 from collections import Counter
 from dataclasses import asdict
 
-from replay_client import (Arm, HttpFrontend, ReplayEngine, apply_server_metrics,
-                           parse_frontend_metrics)
+from replay_client import (Arm, HttpFrontend, ReplayEngine, Timing,
+                           apply_server_metrics, parse_frontend_metrics)
 from trace_gen import WorkloadConfig, generate
 
 
@@ -79,12 +79,33 @@ def _print_summary(label: str, s: dict) -> None:
                   f"itl p50/p95/p99={v['itl_p50']:.2f}/{v['itl_p95']:.2f}/{v['itl_p99']:.2f} ms")
 
 
+async def _warmup(frontend: HttpFrontend, model: str, n: int) -> None:
+    # Standalone-router arms intermittently stalled ~5 s on their first real
+    # requests (one-time setup), which kv never showed. Pay that before the
+    # measured trace, identically for every arm; results are discarded.
+    loop = asyncio.get_running_loop()
+
+    async def one(i: int) -> bool:
+        rec = Timing(request_id=f"warmup-{i}", task_id=f"warmup-{i}", role="warmup",
+                     arm="warmup", model=model)
+        rec.t_admit = loop.time()
+        await frontend.complete(prompt=f"warm up {i}", max_tokens=8, headers={},
+                                record=rec, loop=loop)
+        return rec.ok
+
+    ok = [await one(0)]                                    # first one alone
+    ok += await asyncio.gather(*(one(i) for i in range(1, n)))
+    print(f"warmup: {sum(ok)}/{len(ok)} ok")
+
+
 async def _run(a: argparse.Namespace) -> None:
     cfg = WorkloadConfig(n_tasks=a.n_tasks, victim_frac=a.victim_frac,
                          fanout_k=a.fanout_k, burst_multiplier=a.burst,
                          shared_prefix_blocks=a.prefix_blocks)
     rows = [json.loads(r.to_json()) for r in generate(cfg, a.seed)]
     frontend = HttpFrontend(a.base_url, a.model, max_conns=a.max_concurrency)
+    if a.warmup:
+        await _warmup(frontend, a.model, a.warmup)
     eng = ReplayEngine(rows, Arm.A1, a.model, frontend,
                        max_concurrency=a.max_concurrency,
                        words_per_block=a.words_per_block)
@@ -316,6 +337,8 @@ def main() -> None:
     r.add_argument("--max-concurrency", type=int, default=128)
     r.add_argument("--frontend-log", default=None,
                    help="frontend stdout log; if given, use server-measured TTFT/ITL")
+    r.add_argument("--warmup", type=int, default=8,
+                   help="throwaway requests before the trace (0 to disable)")
     r.add_argument("--no-session-headers", action="store_true",
                    help="omit x-dynamo-session/parent headers (router passthrough path)")
     c = sub.add_parser("compare")
