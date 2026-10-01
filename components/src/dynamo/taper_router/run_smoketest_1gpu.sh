@@ -32,7 +32,11 @@ HTTP_PORT=8100
 # Pilot knobs (defaults keep the original 1-GPU Qwen smoke test):
 #   TP=1 GPUS=0 TOOL_PARSER= REASONING_PARSER=  (e.g. glm47 / glm45 for GLM-4.7-Flash)
 #   DYN_REQUEST_TRACE=1 DYN_REQUEST_TRACE_OUTPUT_PATH=...  records session/parent ids
+#   ANTHROPIC_API=1  serve /v1/messages (Claude Code); off by default so sweep
+#                    runs stay configured exactly like earlier ones
 TP="${TP:-1}"
+FRONTEND_ARGS=()
+[[ "${ANTHROPIC_API:-0}" == "1" ]] && FRONTEND_ARGS+=(--enable-anthropic-api)
 GPUS="${GPUS:-0}"
 PARSER_ARGS=()
 [[ -n "${TOOL_PARSER:-}" ]] && PARSER_ARGS+=(--dyn-tool-call-parser "$TOOL_PARSER")
@@ -82,15 +86,14 @@ fi
 DYN_SYSTEM_PORT=8184 python -m dynamo.frontend \
     --http-host 0.0.0.0 \
     --http-port "$HTTP_PORT" \
-    --router-mode "$ROUTER_MODE" \
-    --enable-anthropic-api \
+    --router-mode "$ROUTER_MODE" ${FRONTEND_ARGS[@]+"${FRONTEND_ARGS[@]}"} \
     --shared-cache-type none &
 
-until curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models/${WORKER_MODEL}/ready" 2>/dev/null \
-    | jq -e '([.namespaces[].worker_types.aggregated.workers // 0] | add) == 1' >/dev/null; do
-    sleep 5
-done
-until curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models" 2>/dev/null | grep -Fq "$MODEL_NAME_ROUTER"; do
+# Ready = the worker's own model name is listed (it registers only once the
+# engine is up) and the public name is listed (router registered). Polling
+# /v1/models/<name>/ready breaks when the Anthropic API is enabled.
+models() { curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models" 2>/dev/null; }
+until models | grep -Fq "\"$WORKER_MODEL\"" && models | grep -Fq "\"$MODEL_NAME_ROUTER\""; do
     sleep 5
 done
 echo "$POLICY smoketest stack ready at http://127.0.0.1:${HTTP_PORT}/v1"

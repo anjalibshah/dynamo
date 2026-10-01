@@ -92,7 +92,7 @@ DYN_SYSTEM_PORT=8184 python -m dynamo.frontend \
     --http-host 0.0.0.0 \
     --http-port "$HTTP_PORT" \
     --router-mode "$ROUTER_MODE" \
-    --enable-anthropic-api \
+    $( [[ "${ANTHROPIC_API:-0}" == "1" ]] && echo --enable-anthropic-api ) \
     --shared-cache-type none &
 
 until curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models/${WORKER_MODEL}/ready" 2>/dev/null \
