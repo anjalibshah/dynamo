@@ -47,6 +47,9 @@ def _records(paths: list[str]):
                     r = json.loads(line)
                 except ValueError:
                     continue
+                # The jsonl sink wraps each record: {"timestamp": ..., "event": {...}}.
+                if isinstance(r.get("event"), dict):
+                    r = r["event"]
                 if r.get("event_type") == "request_end" and r.get("request"):
                     yield r
 
