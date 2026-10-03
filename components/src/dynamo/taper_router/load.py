@@ -90,3 +90,29 @@ class LoadSnapshotProvider:
             # widens rather than after.
             out[worker_id] = out.get(worker_id, 0) + metrics.scheduled_requests.num_decode_requests
         return out
+
+    def iteration_ms(self) -> dict[int, float]:
+        """``{worker_id: latest forward-pass wall time in ms}``, max across dp ranks.
+
+        One iteration emits one token per decoding request, so this is the
+        live per-token latency the shared decode step is imposing. Idle
+        heartbeats (wall_time 0) are skipped.
+        """
+        if self._subscriber is None:
+            return {}
+        try:
+            raw = self._subscriber.get_recent_stats()
+        except Exception as exc:
+            logger.debug("LoadSnapshotProvider iteration_ms error: %s", exc)
+            return {}
+        out: dict[int, float] = {}
+        for (worker_id_str, _dp_rank), payload in raw.items():
+            try:
+                worker_id = int(worker_id_str)
+            except (ValueError, TypeError):
+                continue
+            metrics = decode_fpm(payload)
+            if metrics is None or not metrics.wall_time:
+                continue
+            out[worker_id] = max(out.get(worker_id, 0.0), metrics.wall_time * 1000.0)
+        return out

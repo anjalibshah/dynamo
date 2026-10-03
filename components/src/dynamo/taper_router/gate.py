@@ -97,6 +97,14 @@ class TaperGate:
         self._stat_released = 0
         self._stat_forced_admits = 0
         self._stat_shadow_would_defer = 0
+        # Periodic INFO summary of what the gate sees (decode count and
+        # iteration time), so a gate that never acts can be told apart from
+        # one that never receives load readings.
+        self._load_log_interval_s = 30.0
+        self._load_window: list[float] = []
+        self._iter_window: list[float] = []
+        self._no_reading = 0
+        self._last_load_log = time.monotonic()
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -250,6 +258,7 @@ class TaperGate:
                 await asyncio.sleep(self._cfg.reconcile_interval_seconds)
                 try:
                     await self._reconcile()
+                    self._sample_load()
                     consecutive_failures = 0
                 except Exception:
                     consecutive_failures += 1
@@ -262,6 +271,37 @@ class TaperGate:
                         return
         except asyncio.CancelledError:
             return
+
+    def _sample_load(self) -> None:
+        snap = self._load.snapshot()
+        if snap:
+            self._load_window.append(float(max(snap.values())))
+        else:
+            self._no_reading += 1
+        iteration_ms = getattr(self._load, "iteration_ms", None)
+        if iteration_ms is not None:
+            it = iteration_ms()
+            if it:
+                self._iter_window.append(max(it.values()))
+        now = time.monotonic()
+        if now - self._last_load_log < self._load_log_interval_s:
+            return
+        n = len(self._load_window) + self._no_reading
+        if n:
+            lw, iw = sorted(self._load_window), sorted(self._iter_window)
+
+            def q(v, f):
+                return v[min(len(v) - 1, int(f * len(v)))] if v else float("nan")
+
+            logger.info(
+                "taper.load window=%.0fs samples=%d no_reading=%d decode p50=%.0f "
+                "p95=%.0f max=%.0f iteration_ms p50=%.1f p95=%.1f threshold=%.0f "
+                "deferred_now=%d",
+                now - self._last_load_log, n, self._no_reading, q(lw, 0.5), q(lw, 0.95),
+                lw[-1] if lw else float("nan"), q(iw, 0.5), q(iw, 0.95),
+                self._cfg.load_threshold, len(self._deferred))
+        self._load_window, self._iter_window, self._no_reading = [], [], 0
+        self._last_load_log = now
 
     async def _reconcile(self) -> None:
         """FIFO release of deferred siblings while there's load slack.
