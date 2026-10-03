@@ -319,3 +319,15 @@ async def test_new_branch_queues_behind_deferred_ones():
     await gate._reconcile()
     assert (await asyncio.wait_for(first[0], timeout=1.0)).was_deferred is True
     assert (await asyncio.wait_for(second, timeout=1.0)).was_deferred is True
+
+
+def test_periodic_load_summary_distinguishes_missing_readings(caplog):
+    gate, load = make_gate(load_workers={1: 12})
+    gate._load_log_interval_s = 0.0
+    with caplog.at_level("INFO", logger="dynamo.taper_router.gate"):
+        gate._sample_load()
+        load.workers = {}
+        gate._sample_load()
+    lines = [r.getMessage() for r in caplog.records if "taper.load" in r.getMessage()]
+    assert "no_reading=0" in lines[0] and "max=12" in lines[0]
+    assert "no_reading=1" in lines[1]
