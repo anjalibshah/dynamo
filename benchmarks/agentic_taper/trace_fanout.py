@@ -75,6 +75,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("paths", nargs="+")
+    p.add_argument("--min-agent-requests", type=int, default=5,
+                   help="root tasks with at least this many requests count as agent tasks")
     a = p.parse_args()
 
     reqs = []
@@ -132,13 +134,28 @@ def main() -> None:
     else:
         print("no child-session requests: TAPER would have nothing to gate")
 
-    itls = [r["itl"] for r in reqs if r["itl"] is not None]
-    ttfts = [r["ttft"] for r in reqs if r["ttft"] is not None]
-    durs = [(max(x["end"] for x in rs) - min(x["start"] for x in rs)) / 1000.0
-            for rs in by_root.values()]
-    print(f"latency: ITL p50={_pct(itls, 0.5):.2f} ms p95={_pct(itls, 0.95):.2f} ms  "
-          f"TTFT p50={_pct(ttfts, 0.5):.0f} ms  task duration p50="
-          f"{statistics.median(durs) if durs else 0:.1f} s")
+    # Report agent tasks (multi-request) separately from single-request
+    # interactive traffic: long agent contexts make per-token latency higher,
+    # and pooled task durations are dominated by the many one-shot requests.
+    def lat(label: str, rs: list[dict], tasks: dict) -> None:
+        if not rs:
+            return
+        itls = [r["itl"] for r in rs if r["itl"] is not None]
+        ttfts = [r["ttft"] for r in rs if r["ttft"] is not None]
+        turns = [(r["end"] - r["start"]) / 1000.0 for r in rs]
+        durs = [(max(x["end"] for x in t) - min(x["start"] for x in t)) / 1000.0
+                for t in tasks.values()]
+        print(f"{label}: tasks={len(tasks)} requests={len(rs)}  ITL p50={_pct(itls, 0.5):.2f} "
+              f"p95={_pct(itls, 0.95):.2f} ms  TTFT p50={_pct(ttfts, 0.5):.0f} "
+              f"p95={_pct(ttfts, 0.95):.0f} ms  per-request time p50={_pct(turns, 0.5):.2f} "
+              f"p95={_pct(turns, 0.95):.2f} s  task duration p50="
+              f"{statistics.median(durs):.1f} s max={max(durs):.1f} s")
+
+    agent = {t: rs for t, rs in by_root.items() if len(rs) >= a.min_agent_requests}
+    oneshot = {t: rs for t, rs in by_root.items() if len(rs) < a.min_agent_requests}
+    lat(f"agent tasks (>= {a.min_agent_requests} requests)",
+        [r for rs in agent.values() for r in rs], agent)
+    lat("other (interactive / short)", [r for rs in oneshot.values() for r in rs], oneshot)
 
 
 if __name__ == "__main__":
