@@ -102,6 +102,27 @@ def summarize(path: str, slo_ms: float, skip_first_s: float) -> None:
     for lo, hi in [(1, 2), (2, 4), (4, 8), (8, 16), (16, 10**9)]:
         line(f"decode {lo}-{hi - 1}", [r for r in decode_only if lo <= r["n_decode"] < hi])
 
+    # Step-time model for a context-budget gate: wall_ms ~ a + b * decode_kv_tok
+    # (least squares on decode-only steps, outliers above 100 ms dropped), and
+    # the context K at which the fitted step time reaches the SLO.
+    pts = [(r["decode_kv_tok"], r["wall_ms"]) for r in decode_only if r["wall_ms"] < 100]
+    if len(pts) > 2:
+        n = len(pts)
+        mx, my = sum(x for x, _ in pts) / n, sum(y for _, y in pts) / n
+        sxx = sum((x - mx) ** 2 for x, _ in pts)
+        b = sum((x - mx) * (y - my) for x, y in pts) / sxx if sxx else 0.0
+        a = my - b * mx
+        ss_res = sum((y - a - b * x) ** 2 for x, y in pts)
+        ss_tot = sum((y - my) ** 2 for _, y in pts)
+        k = (slo_ms - a) / b if b > 0 else float("nan")
+        print(f"\nfit (decode-only): step_ms = {a:.2f} + {b * 1000:.4f} x (context / 1k tok)  "
+              f"R^2={1 - ss_res / ss_tot:.2f}")
+        print(f"  context budget K where fitted step = {slo_ms:g} ms: {k / 1000:.0f}k tokens")
+        within = [y for x, y in pts if x <= k]
+        if within:
+            print(f"  steps with context <= K: {len(within) / len(pts):.1%}, of which over SLO "
+                  f"{sum(y > slo_ms for y in within) / len(within):.1%}")
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
