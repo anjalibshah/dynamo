@@ -8,6 +8,9 @@
 #   ./harbor_ab.sh unloaded   # stock kv, nothing else running: 30 sparse
 #                             # victims, then one Claude Code task alone
 #   ./harbor_ab.sh compare    # kv,taper,taper,kv (2 reps, counterbalanced)
+#   ./harbor_ab.sh diag       # not part of the comparison: stock kv + victims,
+#                             # every forward pass recorded (fpm_probe.py), for
+#                             # trunk-only (no instruction) then fan-out (v2)
 #   python3 trace_goodput.py --unloaded-trace $OUT/unloaded/trace.jsonl \
 #       kv-r1=$OUT/kv-r1/trace.jsonl taper-r1=... taper-r2=... kv-r2=...
 #
@@ -38,7 +41,8 @@ URL=http://127.0.0.1:8100
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 PY="$REPO/.venv/bin/python3"
 
-[[ "$MODE" == "unloaded" || "$MODE" == "compare" ]] || { echo "usage: $0 unloaded|compare" >&2; exit 2; }
+DIAG_TASKS="${DIAG_TASKS:-10}"
+[[ "$MODE" =~ ^(unloaded|compare|diag)$ ]] || { echo "usage: $0 unloaded|compare|diag" >&2; exit 2; }
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running (podman system service ...)" >&2; exit 2; }
 curl -fsS "$URL/v1/models" >/dev/null 2>&1 && { echo "something already serves $URL" >&2; exit 2; }
@@ -95,6 +99,34 @@ if [[ "$MODE" == "unloaded" ]]; then
     harbor_job harbor-ab-unloaded -i astropy__astropy-12907 -n 1
     stop_stack
     "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl"
+    exit 0
+fi
+
+if [[ "$MODE" == "diag" ]]; then
+    for run in diag-trunk diag-fanout; do
+        if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
+        echo "=== $run ($(date -u +%H:%M:%S)) ==="
+        start_stack "$run" kv
+        rm -f "$OUT/$run/fpm.jsonl"
+        podman exec -d "$CID" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
+            record --port 20081 --out /workspace/$OUT_REL/$run/fpm.jsonl \
+            > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
+        sleep 20
+        [[ -s "$OUT/$run/fpm.jsonl" ]] || echo "WARNING: fpm_probe recorded nothing yet; see $OUT/$run/fpm_probe.log" >&2
+        "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$URL" --model "$MODEL" \
+            --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
+            --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
+        VPID=$!
+        extra=()
+        [[ "$run" == diag-fanout ]] && extra=(--extra-instruction-path "$INSTR")
+        harbor_job "harbor-ab-$run" -l "$DIAG_TASKS" -n "$CONCURRENT" ${extra[@]+"${extra[@]}"} \
+            || echo "harbor exited non-zero for $run (see jobs/harbor-ab-$run)" >&2
+        kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
+        stop_stack
+        "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl" | head -4
+        python3 "$REPO/benchmarks/agentic_taper/fpm_probe.py" summarize "$OUT/$run/fpm.jsonl" \
+            | tee "$OUT/$run/fpm_summary.txt"
+    done
     exit 0
 fi
 
