@@ -37,10 +37,47 @@ def _requests(path: str, victim_prefix: str) -> list[dict]:
         sess = ctx.get("session_id") or ""
         cls = ("interactive" if sess.startswith(victim_prefix)
                else "agent" if sess else "unlabeled")
-        out.append({"cls": cls, "session": sess, "start": float(start),
-                    "end": float(start) + float(total), "ttft": ttft, "itl": itl,
-                    "out": ntok})
+        out.append({"cls": cls, "session": sess, "parent": ctx.get("parent_session_id"),
+                    "start": float(start), "end": float(start) + float(total),
+                    "ttft": ttft, "itl": itl, "out": ntok})
     return out
+
+
+def _loaded(reqs: list[dict], min_active: int, min_task_requests: int = 5) -> tuple[list[dict], float]:
+    """Keep requests that start while >= min_active agent tasks are in progress.
+
+    A task spans its root session's and its subagents' first request start to
+    last request end. Drops the warm-up ramp and the tail where a straggler
+    task (e.g. a verifier timeout) leaves victims running on an idle GPU.
+    Returns (kept requests, loaded seconds).
+    """
+    parent_of = {r["session"]: r["parent"] for r in reqs if r["cls"] == "agent" and r["parent"]}
+
+    def root(s):
+        seen = set()
+        while s in parent_of and s not in seen:
+            seen.add(s)
+            s = parent_of[s]
+        return s
+
+    tasks = defaultdict(list)
+    for r in reqs:
+        if r["cls"] == "agent":
+            tasks[root(r["session"])].append(r)
+    events = []
+    for rs in tasks.values():
+        if len(rs) >= min_task_requests:
+            events += [(min(r["start"] for r in rs), 1), (max(r["end"] for r in rs), -1)]
+    windows, active, opened = [], 0, None
+    for t, d in sorted(events):
+        active += d
+        if active >= min_active and opened is None:
+            opened = t
+        elif active < min_active and opened is not None:
+            windows.append((opened, t))
+            opened = None
+    kept = [r for r in reqs if any(a <= r["start"] < b for a, b in windows)]
+    return kept, sum(b - a for a, b in windows) / 1000.0
 
 
 def main() -> None:
@@ -54,6 +91,9 @@ def main() -> None:
     p.add_argument("--interactive-ttft-ms", type=float, default=500.0)
     p.add_argument("--agent-ttft-ms", type=float, default=2000.0)
     p.add_argument("--victim-prefix", default="victim-")
+    p.add_argument("--min-active-tasks", type=int, default=0,
+                   help="only judge requests that start while at least this many agent "
+                        "tasks are in progress (0 = whole run, the pre-registered window)")
     a = p.parse_args()
 
     anchors = {"interactive": a.unloaded_interactive_itl_ms, "agent": a.unloaded_agent_itl_ms}
@@ -80,8 +120,10 @@ def main() -> None:
             return False
         return r["itl"] is None or r["itl"] <= itl_b
 
+    if a.min_active_tasks:
+        print(f"window: only requests starting while >= {a.min_active_tasks} agent tasks are active")
     print()
-    head = ["run", "goodput(all)", "interactive", "agent", "int ITL p50/p95",
+    head = ["run", "loaded min", "goodput(all)", "interactive", "agent", "int ITL p50/p95",
             "agent ITL p50/p95", "agent TTFT p50/p95", "req/s", "out tok/s", "unlabeled"]
     print(" | ".join(head))
     for spec in a.runs:
@@ -90,6 +132,13 @@ def main() -> None:
         if not reqs:
             print(f"{label} | no requests in {path}")
             continue
+        if a.min_active_tasks:
+            reqs, loaded_s = _loaded(reqs, a.min_active_tasks)
+            if not reqs:
+                print(f"{label} | never reached {a.min_active_tasks} active tasks")
+                continue
+        else:
+            loaded_s = (max(r["end"] for r in reqs) - min(r["start"] for r in reqs)) / 1000.0
         by = defaultdict(list)
         for r in reqs:
             by[r["cls"]].append(r)
@@ -104,7 +153,7 @@ def main() -> None:
             return f"{_pct(v, 0.5):.1f}/{_pct(v, 0.95):.1f}" if v else "-"
 
         print(" | ".join([
-            label, gp(judged), gp(by["interactive"]), gp(by["agent"]),
+            label, f"{loaded_s / 60:.0f}", gp(judged), gp(by["interactive"]), gp(by["agent"]),
             pq(by["interactive"], "itl"), pq(by["agent"], "itl"), pq(by["agent"], "ttft"),
             f"{len(reqs) / span_s:.2f}", f"{sum(r['out'] for r in reqs) / span_s:.0f}",
             str(len(by["unlabeled"])),
