@@ -42,6 +42,7 @@ SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 PY="$REPO/.venv/bin/python3"
 
 DIAG_TASKS="${DIAG_TASKS:-10}"
+DIAG_TAG="${DIAG_TAG:-}"             # e.g. DIAG_TAG=-n5 CONCURRENT=5 ./harbor_ab.sh diag
 [[ "$MODE" =~ ^(unloaded|compare|diag)$ ]] || { echo "usage: $0 unloaded|compare|diag" >&2; exit 2; }
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running (podman system service ...)" >&2; exit 2; }
@@ -103,7 +104,7 @@ if [[ "$MODE" == "unloaded" ]]; then
 fi
 
 if [[ "$MODE" == "diag" ]]; then
-    for run in diag-trunk diag-fanout; do
+    for run in "diag-trunk${DIAG_TAG}" "diag-fanout${DIAG_TAG}"; do
         if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
         echo "=== $run ($(date -u +%H:%M:%S)) ==="
         start_stack "$run" kv
@@ -111,14 +112,15 @@ if [[ "$MODE" == "diag" ]]; then
         podman exec -d "$CID" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
             record --port 20081 --out /workspace/$OUT_REL/$run/fpm.jsonl \
             > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
-        sleep 20
-        [[ -s "$OUT/$run/fpm.jsonl" ]] || echo "WARNING: fpm_probe recorded nothing yet; see $OUT/$run/fpm_probe.log" >&2
+        sleep 10  # idle steps aren't recorded, so check the process, not the file
+        podman exec "$CID" pgrep -f fpm_probe.py >/dev/null \
+            || echo "WARNING: fpm_probe is not running; see $OUT/$run/fpm_probe.log" >&2
         "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$URL" --model "$MODEL" \
             --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
             --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
         VPID=$!
         extra=()
-        [[ "$run" == diag-fanout ]] && extra=(--extra-instruction-path "$INSTR")
+        [[ "$run" == diag-fanout* ]] && extra=(--extra-instruction-path "$INSTR")
         harbor_job "harbor-ab-$run" -l "$DIAG_TASKS" -n "$CONCURRENT" ${extra[@]+"${extra[@]}"} \
             || echo "harbor exited non-zero for $run (see jobs/harbor-ab-$run)" >&2
         kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
