@@ -91,6 +91,13 @@ def main() -> None:
     p.add_argument("--interactive-ttft-ms", type=float, default=500.0)
     p.add_argument("--agent-ttft-ms", type=float, default=2000.0)
     p.add_argument("--victim-prefix", default="victim-")
+    p.add_argument("--e2e", action="store_true",
+                   help="judge each request by one end-to-end deadline, total_time <= "
+                        "TTFT bound + ITL bound x (tokens - 1), instead of TTFT and ITL "
+                        "separately. Needed whenever a standalone router (taper_router) "
+                        "is in the path: the frontend then reports the router's TTFT, "
+                        "which starts after the gate wait, while total_time stays "
+                        "frontend end-to-end, so the wait leaks into ITL.")
     p.add_argument("--min-active-tasks", type=int, default=0,
                    help="only judge requests that start while at least this many agent "
                         "tasks are in progress (0 = whole run, the pre-registered window)")
@@ -114,8 +121,13 @@ def main() -> None:
         print(f"SLO {cls}: TTFT <= {ttft_b:g} ms, ITL <= {itl_b:.2f} ms "
               f"(unloaded ITL {anchors[cls]:.2f} ms x {a.factor:g})")
 
+    if a.e2e:
+        print("rule: end-to-end deadline, total_time <= TTFT bound + ITL bound x (tokens - 1)")
+
     def ok(r: dict) -> bool:
         ttft_b, itl_b = slo[r["cls"]]
+        if a.e2e:
+            return r["end"] - r["start"] <= ttft_b + itl_b * max(r["out"] - 1, 0)
         if r["ttft"] is None or r["ttft"] > ttft_b:
             return False
         return r["itl"] is None or r["itl"] <= itl_b
