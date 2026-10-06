@@ -141,7 +141,7 @@ if [[ "$MODE" == "diag" ]]; then
 fi
 
 for run in $ORDER; do
-    arm=${run%-r*}
+    arm=${run%-*}         # kv-r1 -> kv, ctx-p1 -> ctx, kv-c2 -> kv
     if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
     echo "=== $run ($(date -u +%H:%M:%S)) ==="
     case "$arm" in
