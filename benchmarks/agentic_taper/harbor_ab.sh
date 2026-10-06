@@ -35,6 +35,8 @@ THRESHOLD="${THRESHOLD:-32}"
 # ctx arm (second registration, NEXT_STEPS 7.3f): count cap + context budget
 CTX_THRESHOLD="${CTX_THRESHOLD:-7}"
 CTX_BUDGET="${CTX_BUDGET:-300000}"
+# cap arm (third registration, NEXT_STEPS 7.3g): ctx gate with a bounded hold
+CAP_TIMEOUT="${CAP_TIMEOUT:-1.0}"
 VICTIM_MEAN_MS="${VICTIM_MEAN_MS:-2000}"
 ORDER="${ORDER:-kv-r1 taper-r1 taper-r2 kv-r2}"
 INSTR="$REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md"
@@ -149,6 +151,9 @@ for run in $ORDER; do
         taper) start_stack "$run" taper -e "DYN_TAPER_LOAD_THRESHOLD=$THRESHOLD" ;;
         ctx)   start_stack "$run" taper -e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" \
                    -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET" ;;
+        cap)   start_stack "$run" taper -e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" \
+                   -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET" \
+                   -e "DYN_TAPER_DEFER_TIMEOUT_SECONDS=$CAP_TIMEOUT" ;;
         *) echo "unknown arm in $run" >&2; exit 2 ;;
     esac
     start_probe "$run"

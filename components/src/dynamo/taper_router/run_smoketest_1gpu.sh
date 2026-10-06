@@ -69,6 +69,7 @@ if [[ "$POLICY" == "taper" ]]; then
         --router-block-size "$BLOCK_SIZE" \
         --load-threshold "${DYN_TAPER_LOAD_THRESHOLD:-32}" \
         --context-budget-tokens "${DYN_TAPER_CONTEXT_BUDGET_TOKENS:-0}" \
+        --defer-timeout-seconds "${DYN_TAPER_DEFER_TIMEOUT_SECONDS:-300}" \
         $( [[ "${DYN_TAPER_SHADOW_MODE:-false}" == "true" ]] && echo --shadow-mode || echo --no-shadow-mode ) \
         --shared-cache-type none &
     ROUTER_MODE=round-robin
