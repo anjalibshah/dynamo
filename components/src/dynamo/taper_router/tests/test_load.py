@@ -86,6 +86,17 @@ def test_snapshot_returns_empty_when_subscriber_unset():
     assert provider.snapshot() == {}
 
 
+def test_decode_context_sums_kv_tokens_across_dp_ranks():
+    def ctx_fpm(dp_rank: int, tokens: int) -> bytes:
+        return encode(ForwardPassMetrics(
+            worker_id="1", dp_rank=dp_rank,
+            scheduled_requests=ScheduledRequestMetrics(
+                num_decode_requests=2, sum_decode_kv_tokens=tokens)))
+
+    provider = _make_provider({("1", 0): ctx_fpm(0, 120_000), ("1", 1): ctx_fpm(1, 30_000)})
+    assert provider.decode_context() == {1: 150_000}
+
+
 def test_snapshot_returns_empty_on_subscriber_error():
     class _RaisingSubscriber:
         def get_recent_stats(self):

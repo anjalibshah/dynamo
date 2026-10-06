@@ -32,6 +32,9 @@ REASONING_PARSER="${REASONING_PARSER:-glm45}"
 N_TASKS="${N_TASKS:-30}"
 CONCURRENT="${CONCURRENT:-10}"
 THRESHOLD="${THRESHOLD:-32}"
+# ctx arm (second registration, NEXT_STEPS 7.3f): count cap + context budget
+CTX_THRESHOLD="${CTX_THRESHOLD:-7}"
+CTX_BUDGET="${CTX_BUDGET:-300000}"
 VICTIM_MEAN_MS="${VICTIM_MEAN_MS:-2000}"
 ORDER="${ORDER:-kv-r1 taper-r1 taper-r2 kv-r2}"
 INSTR="$REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md"
@@ -76,6 +79,17 @@ start_stack() {  # start_stack <run> <policy> [extra -e args...]
     sleep 5
 }
 
+start_probe() {  # start_probe <run>: record every forward pass (read-only)
+    local run=$1
+    rm -f "$OUT/$run/fpm.jsonl"
+    podman exec -d "$CID" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
+        record --port 20081 --out /workspace/$OUT_REL/$run/fpm.jsonl \
+        > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
+    sleep 10  # idle steps aren't recorded, so check the process, not the file
+    podman exec "$CID" pgrep -f fpm_probe.py >/dev/null 2>&1 \
+        || echo "WARNING: fpm_probe may not be running; see $OUT/$run/fpm_probe.log" >&2
+}
+
 stop_stack() {
     podman stop -t 10 "$CID" >/dev/null || true
     wait_for 180 gpu_idle || { echo "GPU still busy" >&2; exit 1; }
@@ -108,13 +122,7 @@ if [[ "$MODE" == "diag" ]]; then
         if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
         echo "=== $run ($(date -u +%H:%M:%S)) ==="
         start_stack "$run" kv
-        rm -f "$OUT/$run/fpm.jsonl"
-        podman exec -d "$CID" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
-            record --port 20081 --out /workspace/$OUT_REL/$run/fpm.jsonl \
-            > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
-        sleep 10  # idle steps aren't recorded, so check the process, not the file
-        podman exec "$CID" pgrep -f fpm_probe.py >/dev/null \
-            || echo "WARNING: fpm_probe is not running; see $OUT/$run/fpm_probe.log" >&2
+        start_probe "$run"
         "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$URL" --model "$MODEL" \
             --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
             --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
@@ -139,8 +147,11 @@ for run in $ORDER; do
     case "$arm" in
         kv)    start_stack "$run" kv ;;
         taper) start_stack "$run" taper -e "DYN_TAPER_LOAD_THRESHOLD=$THRESHOLD" ;;
+        ctx)   start_stack "$run" taper -e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" \
+                   -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET" ;;
         *) echo "unknown arm in $run" >&2; exit 2 ;;
     esac
+    start_probe "$run"
     # Interactive traffic for the whole run; analysis uses the server trace,
     # so the client is simply stopped when the agents finish.
     "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$URL" --model "$MODEL" \
@@ -152,6 +163,12 @@ for run in $ORDER; do
     kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
     stop_stack
     "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl" | head -4
+    if [[ "$arm" != kv ]]; then
+        log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
+        echo "gate: defers=$(grep -c 'taper.defer' <<<"$log" || true)" \
+             "releases=$(grep -c 'reconcile released' <<<"$log" || true)" \
+             "forced=$(grep -c 'taper.forced_admit' <<<"$log" || true)"
+    fi
 done
 echo "done. Next: $PY $REPO/benchmarks/agentic_taper/trace_goodput.py --unloaded-trace $OUT/unloaded/trace.jsonl \\"
 echo "  $(for r in $ORDER; do printf '%s=%s ' "$r" "$OUT/$r/trace.jsonl"; done)"

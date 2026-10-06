@@ -78,6 +78,12 @@ class TaperConfig:
     # low reading drained the backlog at once (58, then 30, then 29 on a
     # 1-GPU run), recreating the prefill burst the gate exists to prevent.
     max_release_per_tick: int = 4
+    # Context budget (tokens): also defer a branch while the busiest worker's
+    # live decode context plus the branch's prompt would exceed this. 0
+    # disables it. Step time tracks total decode context more than decode
+    # count on long-context agents; the budget is the context at which the
+    # fitted step time reaches the interactive ITL SLO (NEXT_STEPS 7.3e).
+    context_budget_tokens: float = 0.0
 
 
 class TaperGate:
@@ -86,9 +92,11 @@ class TaperGate:
         self._cfg = config
         self._table = TaskTable()
         self._lock = asyncio.Lock()
-        self._deferred: list[tuple[str, str, asyncio.Event]] = []  # (task_id, request_id, event)
-        # Monotonic times of recent branch admissions, not yet visible in FPM.
-        self._recent_admits: deque[float] = deque()
+        # (task_id, request_id, event, prompt_tokens)
+        self._deferred: list[tuple[str, str, asyncio.Event, int]] = []
+        # (monotonic time, prompt tokens) of recent branch admissions, not yet
+        # visible in FPM.
+        self._recent_admits: deque[tuple[float, int]] = deque()
         self._scheduler_task: Optional[asyncio.Task] = None
         self._stat_tasks_created = 0
         self._stat_protected_admitted = 0
@@ -103,6 +111,7 @@ class TaperGate:
         self._load_log_interval_s = 30.0
         self._load_window: list[float] = []
         self._iter_window: list[float] = []
+        self._ctx_window: list[float] = []
         self._no_reading = 0
         self._last_load_log = time.monotonic()
 
@@ -111,8 +120,10 @@ class TaperGate:
             return
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         logger.info(
-            "TaperGate started (load_threshold=%.1f, reconcile=%ss, shadow_mode=%s)",
+            "TaperGate started (load_threshold=%.1f, context_budget_tokens=%.0f, "
+            "reconcile=%ss, shadow_mode=%s)",
             self._cfg.load_threshold,
+            self._cfg.context_budget_tokens,
             self._cfg.reconcile_interval_seconds,
             self._cfg.shadow_mode,
         )
@@ -136,24 +147,51 @@ class TaperGate:
             return 0.0
         return float(max(snapshot.values()))
 
+    def _current_context(self) -> float:
+        # Optional signal: providers without decode_context() (and cold start)
+        # contribute no context, so the budget fails open like the count.
+        decode_context = getattr(self._load, "decode_context", None)
+        snapshot = decode_context() if decode_context is not None else {}
+        return float(max(snapshot.values())) if snapshot else 0.0
+
+    def _prune_recent_locked(self) -> None:
+        cutoff = time.monotonic() - self._cfg.admit_settle_seconds
+        while self._recent_admits and self._recent_admits[0][0] < cutoff:
+            self._recent_admits.popleft()
+
     def _projected_load_locked(self) -> float:
         # Caller holds self._lock. Conservative: an admission can briefly be
         # counted both here and in FPM once FPM catches up.
-        cutoff = time.monotonic() - self._cfg.admit_settle_seconds
-        while self._recent_admits and self._recent_admits[0] < cutoff:
-            self._recent_admits.popleft()
+        self._prune_recent_locked()
         return self._current_load() + len(self._recent_admits)
 
-    def _record_admit_locked(self) -> None:
-        self._recent_admits.append(time.monotonic())
+    def _projected_context_locked(self) -> float:
+        self._prune_recent_locked()
+        return self._current_context() + sum(t for _, t in self._recent_admits)
+
+    def _has_room_locked(self, prompt_tokens: int) -> tuple[bool, float, float]:
+        """(room for this branch, projected count, projected context)."""
+        load = self._projected_load_locked()
+        ctx = self._projected_context_locked() if self._cfg.context_budget_tokens > 0 else 0.0
+        room = load <= self._cfg.load_threshold
+        # ctx > 0: with nothing decoding, admit even a branch whose prompt
+        # alone exceeds the budget rather than starving it to the timeout.
+        if self._cfg.context_budget_tokens > 0 and ctx > 0:
+            room = room and ctx + prompt_tokens <= self._cfg.context_budget_tokens
+        return room, load, ctx
+
+    def _record_admit_locked(self, prompt_tokens: int = 0) -> None:
+        self._recent_admits.append((time.monotonic(), prompt_tokens))
 
     async def before_request(self, task_id: str, request_id: str, *,
-                             is_trunk: bool) -> GateDecision:
+                             is_trunk: bool, prompt_tokens: int = 0) -> GateDecision:
         """Admit or defer one request.
 
         ``is_trunk``: the request belongs to the task's own session (a root
         turn or a join), not a child branch session. Trunk requests are
         always admitted; only branch requests are gated.
+        ``prompt_tokens``: the request's input length, i.e. the decode context
+        it adds once admitted (checked against ``context_budget_tokens``).
         """
         wait_started = time.monotonic()
         async with self._lock:
@@ -170,11 +208,11 @@ class TaperGate:
                 return GateDecision(task_id=task_id, request_id=request_id,
                                      admitted=True, protected=True)
 
-            load = self._projected_load_locked()
+            room, load, ctx = self._has_room_locked(prompt_tokens)
             # Queue behind already-deferred branches so release stays FIFO.
-            would_defer = bool(self._deferred) or load > self._cfg.load_threshold
+            would_defer = bool(self._deferred) or not room
             if not would_defer or self._cfg.shadow_mode:
-                self._record_admit_locked()
+                self._record_admit_locked(prompt_tokens)
                 task.inflight_opportunistic += 1
                 task.admitted_total += 1
                 if would_defer:
@@ -189,15 +227,17 @@ class TaperGate:
                 return GateDecision(task_id=task_id, request_id=request_id, admitted=True,
                                      protected=False, shadow_would_defer=would_defer)
 
-            # Live gating, load over threshold: defer.
+            # Live gating, no room: defer.
             event = asyncio.Event()
-            self._deferred.append((task_id, request_id, event))
+            self._deferred.append((task_id, request_id, event, prompt_tokens))
             task.deferred_request_ids.append(request_id)
             task.deferred_total += 1
             self._stat_deferred += 1
             logger.info(
-                "taper.defer task=%s request=%s load=%.1f threshold=%.1f deferred_total=%d",
-                task_id, request_id, load, self._cfg.load_threshold, len(self._deferred),
+                "taper.defer task=%s request=%s load=%.1f threshold=%.1f ctx=%.0f "
+                "prompt=%d budget=%.0f deferred_total=%d",
+                task_id, request_id, load, self._cfg.load_threshold, ctx, prompt_tokens,
+                self._cfg.context_budget_tokens, len(self._deferred),
             )
 
         forced = False
@@ -207,6 +247,7 @@ class TaperGate:
             forced = True
             async with self._lock:
                 self._remove_deferred_locked(task_id, request_id)
+                self._record_admit_locked(prompt_tokens)
                 task = self._table.get_or_create(task_id)
                 task.inflight_opportunistic += 1
                 task.admitted_total += 1
@@ -276,6 +317,7 @@ class TaperGate:
         snap = self._load.snapshot()
         if snap:
             self._load_window.append(float(max(snap.values())))
+            self._ctx_window.append(self._current_context())
         else:
             self._no_reading += 1
         iteration_ms = getattr(self._load, "iteration_ms", None)
@@ -289,18 +331,22 @@ class TaperGate:
         n = len(self._load_window) + self._no_reading
         if n:
             lw, iw = sorted(self._load_window), sorted(self._iter_window)
+            cw = sorted(self._ctx_window)
 
             def q(v, f):
                 return v[min(len(v) - 1, int(f * len(v)))] if v else float("nan")
 
             logger.info(
                 "taper.load window=%.0fs samples=%d no_reading=%d decode p50=%.0f "
-                "p95=%.0f max=%.0f iteration_ms p50=%.1f p95=%.1f threshold=%.0f "
-                "deferred_now=%d",
+                "p95=%.0f max=%.0f ctx_k p50=%.0f p95=%.0f max=%.0f iteration_ms "
+                "p50=%.1f p95=%.1f threshold=%.0f budget_k=%.0f deferred_now=%d",
                 now - self._last_load_log, n, self._no_reading, q(lw, 0.5), q(lw, 0.95),
-                lw[-1] if lw else float("nan"), q(iw, 0.5), q(iw, 0.95),
-                self._cfg.load_threshold, len(self._deferred))
-        self._load_window, self._iter_window, self._no_reading = [], [], 0
+                lw[-1] if lw else float("nan"), q(cw, 0.5) / 1e3, q(cw, 0.95) / 1e3,
+                (cw[-1] if cw else float("nan")) / 1e3, q(iw, 0.5), q(iw, 0.95),
+                self._cfg.load_threshold, self._cfg.context_budget_tokens / 1e3,
+                len(self._deferred))
+        self._load_window, self._iter_window, self._ctx_window = [], [], []
+        self._no_reading = 0
         self._last_load_log = now
 
     async def _reconcile(self) -> None:
@@ -320,9 +366,9 @@ class TaperGate:
             # rises as we go; the per-tick cap bounds the burst further.
             while (self._deferred
                    and released < self._cfg.max_release_per_tick
-                   and self._projected_load_locked() <= self._cfg.load_threshold):
-                task_id, request_id, event = self._deferred.pop(0)
-                self._record_admit_locked()
+                   and self._has_room_locked(self._deferred[0][3])[0]):
+                task_id, request_id, event, prompt_tokens = self._deferred.pop(0)
+                self._record_admit_locked(prompt_tokens)
                 task = self._table.tasks.get(task_id)
                 if task is not None and request_id in task.deferred_request_ids:
                     task.deferred_request_ids.remove(request_id)
@@ -342,6 +388,8 @@ class TaperGate:
                 "deferred_total": len(self._deferred),
                 "load": self._current_load(),
                 "load_threshold": self._cfg.load_threshold,
+                "context": self._current_context(),
+                "context_budget_tokens": self._cfg.context_budget_tokens,
                 "shadow_mode": self._cfg.shadow_mode,
                 "tasks": [
                     {
