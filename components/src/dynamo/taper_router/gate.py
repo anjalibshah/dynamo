@@ -240,22 +240,26 @@ class TaperGate:
                 self._cfg.context_budget_tokens, len(self._deferred),
             )
 
-        forced = False
         try:
             await asyncio.wait_for(event.wait(), timeout=self._cfg.defer_timeout_seconds)
         except asyncio.TimeoutError:
-            forced = True
+            forced = False
             async with self._lock:
-                self._remove_deferred_locked(task_id, request_id)
-                self._record_admit_locked(prompt_tokens)
-                task = self._table.get_or_create(task_id)
-                task.inflight_opportunistic += 1
-                task.admitted_total += 1
-                self._stat_forced_admits += 1
-            logger.warning(
-                "taper.forced_admit task=%s request=%s after %.1fs",
-                task_id, request_id, self._cfg.defer_timeout_seconds,
-            )
+                # A reconcile tick may have released this request just as the
+                # timeout fired; it is then already counted as admitted.
+                if not event.is_set():
+                    forced = True
+                    self._remove_deferred_locked(task_id, request_id)
+                    self._record_admit_locked(prompt_tokens)
+                    task = self._table.get_or_create(task_id)
+                    task.inflight_opportunistic += 1
+                    task.admitted_total += 1
+                    self._stat_forced_admits += 1
+            if forced:
+                logger.info(
+                    "taper.forced_admit task=%s request=%s after %.2fs",
+                    task_id, request_id, self._cfg.defer_timeout_seconds,
+                )
 
         waited = time.monotonic() - wait_started
         return GateDecision(task_id=task_id, request_id=request_id, admitted=True,

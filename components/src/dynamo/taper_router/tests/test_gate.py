@@ -403,3 +403,33 @@ async def test_trunk_is_never_gated_by_context_budget():
     d = await asyncio.wait_for(
         gate.before_request("t1", "t1", is_trunk=True, prompt_tokens=100_000), timeout=1.0)
     assert d.protected is True and d.was_deferred is False
+
+
+@pytest.mark.asyncio
+async def test_short_hold_cap_force_admits_and_counts_once():
+    gate, _ = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=7.0, defer_timeout_seconds=0.05, shadow_mode=False),
+    )
+    d = await asyncio.wait_for(gate.before_request("t1", "t1-b0", is_trunk=False), timeout=1.0)
+    assert d.was_deferred is True
+    assert gate._stat_forced_admits == 1
+    assert gate._table.tasks["t1"].inflight_opportunistic == 1
+    assert not gate._deferred
+
+
+@pytest.mark.asyncio
+async def test_release_racing_timeout_is_not_counted_as_forced():
+    gate, load = make_gate(
+        load_workers={1: 100},
+        config=TaperConfig(load_threshold=7.0, defer_timeout_seconds=0.05, shadow_mode=False),
+    )
+    fut = asyncio.ensure_future(gate.before_request("t1", "t1-b0", is_trunk=False))
+    await asyncio.sleep(0.01)
+    load.workers = {1: 0}
+    await gate._reconcile()  # released before the timeout
+    d = await asyncio.wait_for(fut, timeout=1.0)
+    assert d.was_deferred is True
+    assert gate._stat_forced_admits == 0
+    assert gate._stat_released == 1
+    assert gate._table.tasks["t1"].inflight_opportunistic == 1
