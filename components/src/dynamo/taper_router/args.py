@@ -28,6 +28,7 @@ class TaperRouterConfig(DynamoRouterConfig):
     shadow_mode: bool
     admit_settle_seconds: float
     max_release_per_tick: int
+    context_budget_tokens: float = 0.0
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -41,6 +42,7 @@ class TaperRouterConfig(DynamoRouterConfig):
             shadow_mode=self.shadow_mode,
             admit_settle_seconds=self.admit_settle_seconds,
             max_release_per_tick=self.max_release_per_tick,
+            context_budget_tokens=self.context_budget_tokens,
         )
 
     def validate(self) -> None:  # type: ignore[override]
@@ -49,6 +51,8 @@ class TaperRouterConfig(DynamoRouterConfig):
             raise ValueError("--load-threshold must be > 0")
         if self.admit_settle_seconds < 0:
             raise ValueError("--admit-settle-seconds must be >= 0")
+        if self.context_budget_tokens < 0:
+            raise ValueError("--context-budget-tokens must be >= 0")
         if self.max_release_per_tick < 1:
             raise ValueError("--max-release-per-tick must be >= 1")
         if self.reconcile_interval_seconds <= 0:
@@ -116,6 +120,18 @@ class TaperArgGroup(ArgGroup):
             help="Most deferred branches released per reconcile tick, so a "
             "backlog drains gradually instead of in one burst (default: 4).",
             arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--context-budget-tokens",
+            env_var="DYN_TAPER_CONTEXT_BUDGET_TOKENS",
+            default=0.0,
+            help="Also defer an opportunistic sibling while the busiest "
+            "worker's live decode context (sum_decode_kv_tokens) plus the "
+            "sibling's prompt length would exceed this many tokens. Set it "
+            "to the context at which step time reaches the interactive ITL "
+            "SLO (fpm_probe.py summarize reports it). 0 disables (default: 0).",
+            arg_type=float,
         )
         add_negatable_bool_argument(
             g,

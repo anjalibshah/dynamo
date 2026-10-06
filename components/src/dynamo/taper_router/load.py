@@ -91,6 +91,32 @@ class LoadSnapshotProvider:
             out[worker_id] = out.get(worker_id, 0) + metrics.scheduled_requests.num_decode_requests
         return out
 
+    def decode_context(self) -> dict[int, int]:
+        """``{worker_id: sum_decode_kv_tokens}``, summed across dp ranks.
+
+        Total KV context the decode step attends over. On Harbor/SWE-bench
+        agents, step time tracks this more than the decode count: one 75k-token
+        agent turn already costs ~8 ms per step (NEXT_STEPS 7.3e diagnostics).
+        """
+        if self._subscriber is None:
+            return {}
+        try:
+            raw = self._subscriber.get_recent_stats()
+        except Exception as exc:
+            logger.debug("LoadSnapshotProvider decode_context error: %s", exc)
+            return {}
+        out: dict[int, int] = {}
+        for (worker_id_str, _dp_rank), payload in raw.items():
+            try:
+                worker_id = int(worker_id_str)
+            except (ValueError, TypeError):
+                continue
+            metrics = decode_fpm(payload)
+            if metrics is None:
+                continue
+            out[worker_id] = out.get(worker_id, 0) + metrics.scheduled_requests.sum_decode_kv_tokens
+        return out
+
     def iteration_ms(self) -> dict[int, float]:
         """``{worker_id: latest forward-pass wall time in ms}``, max across dp ranks.
 

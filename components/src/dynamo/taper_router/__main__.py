@@ -166,7 +166,9 @@ class TaperRouterHandler:
             return
 
         self._stat_gated_requests += 1
-        decision = await self._gate.before_request(task_id, request_id, is_trunk=is_trunk)
+        decision = await self._gate.before_request(
+            task_id, request_id, is_trunk=is_trunk,
+            prompt_tokens=len(request.get("token_ids") or ()))
         logger.debug(
             "taper.route path=gated task=%s request=%s protected=%s "
             "was_deferred=%s waited=%.4fs",

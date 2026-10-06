@@ -25,9 +25,13 @@ class FakeLoad:
     """Stand-in for LoadSnapshotProvider with a directly settable snapshot."""
 
     workers: dict[int, int] = field(default_factory=dict)
+    context: dict[int, int] = field(default_factory=dict)
 
     def snapshot(self) -> dict[int, int]:
         return dict(self.workers)
+
+    def decode_context(self) -> dict[int, int]:
+        return dict(self.context)
 
 
 def make_gate(
@@ -331,3 +335,71 @@ def test_periodic_load_summary_distinguishes_missing_readings(caplog):
     lines = [r.getMessage() for r in caplog.records if "taper.load" in r.getMessage()]
     assert "no_reading=0" in lines[0] and "max=12" in lines[0]
     assert "no_reading=1" in lines[1]
+
+
+def _budget_gate(context: dict[int, int], budget: float = 300_000):
+    gate, load = make_gate(
+        load_workers={1: 2},
+        config=TaperConfig(load_threshold=7.0, defer_timeout_seconds=5.0, shadow_mode=False,
+                           admit_settle_seconds=0.05, context_budget_tokens=budget),
+    )
+    load.context = context
+    return gate, load
+
+
+@pytest.mark.asyncio
+async def test_context_budget_defers_branch_with_low_count_then_releases():
+    gate, load = _budget_gate({1: 250_000})
+    branch = asyncio.ensure_future(
+        gate.before_request("t1", "t1-branch-0", is_trunk=False, prompt_tokens=80_000))
+    await asyncio.sleep(0.02)
+    assert not branch.done()  # 2 decoding is under the count cap, but 330k > 300k
+    load.context = {1: 150_000}
+    await gate._reconcile()
+    assert (await asyncio.wait_for(branch, timeout=1.0)).was_deferred is True
+
+
+@pytest.mark.asyncio
+async def test_context_budget_admits_branch_that_fits():
+    gate, _ = _budget_gate({1: 150_000})
+    d = await asyncio.wait_for(
+        gate.before_request("t1", "t1-branch-0", is_trunk=False, prompt_tokens=80_000), timeout=1.0)
+    assert d.was_deferred is False
+
+
+@pytest.mark.asyncio
+async def test_context_budget_disabled_ignores_context():
+    gate, _ = _budget_gate({1: 900_000}, budget=0)
+    d = await asyncio.wait_for(
+        gate.before_request("t1", "t1-branch-0", is_trunk=False, prompt_tokens=80_000), timeout=1.0)
+    assert d.was_deferred is False
+
+
+@pytest.mark.asyncio
+async def test_context_budget_admits_oversized_branch_when_nothing_decodes():
+    gate, _ = _budget_gate({1: 0})
+    d = await asyncio.wait_for(
+        gate.before_request("t1", "t1-branch-0", is_trunk=False, prompt_tokens=400_000), timeout=1.0)
+    assert d.was_deferred is False
+
+
+@pytest.mark.asyncio
+async def test_recent_admit_prompts_count_toward_context():
+    gate, _ = _budget_gate({1: 100_000})
+    gate._cfg.admit_settle_seconds = 10.0
+    first = await asyncio.wait_for(
+        gate.before_request("t1", "t1-branch-0", is_trunk=False, prompt_tokens=150_000), timeout=1.0)
+    assert first.was_deferred is False
+    second = asyncio.ensure_future(
+        gate.before_request("t1", "t1-branch-1", is_trunk=False, prompt_tokens=80_000))
+    await asyncio.sleep(0.02)
+    assert not second.done()  # FPM still says 100k, but 150k was just admitted
+    second.cancel()
+
+
+@pytest.mark.asyncio
+async def test_trunk_is_never_gated_by_context_budget():
+    gate, _ = _budget_gate({1: 900_000})
+    d = await asyncio.wait_for(
+        gate.before_request("t1", "t1", is_trunk=True, prompt_tokens=100_000), timeout=1.0)
+    assert d.protected is True and d.was_deferred is False
