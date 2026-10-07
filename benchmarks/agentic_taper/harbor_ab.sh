@@ -48,6 +48,13 @@ PY="$REPO/.venv/bin/python3"
 
 DIAG_TASKS="${DIAG_TASKS:-10}"
 DIAG_TAG="${DIAG_TAG:-}"             # e.g. DIAG_TAG=-n5 CONCURRENT=5 ./harbor_ab.sh diag
+DIAG_KINDS="${DIAG_KINDS:-trunk fanout}"   # e.g. DIAG_KINDS=fanout for the scale check
+# Data-parallel model copies, one per GPU (needs a WORKERS-GPU allocation).
+# Scale CONCURRENT and VICTIM_MEAN_MS with it, e.g. WORKERS=8 CONCURRENT=80
+# VICTIM_MEAN_MS=250.
+WORKERS="${WORKERS:-1}"
+FPM_PORTS=20081
+for (( i = 1; i < WORKERS; i++ )); do FPM_PORTS+=",$((20100 + i))"; done
 [[ "$MODE" =~ ^(unloaded|compare|diag)$ ]] || { echo "usage: $0 unloaded|compare|diag" >&2; exit 2; }
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running (podman system service ...)" >&2; exit 2; }
@@ -71,10 +78,12 @@ start_stack() {  # start_stack <run> <policy> [extra -e args...]
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" \
         -e "TOOL_PARSER=$TOOL_PARSER" -e "REASONING_PARSER=$REASONING_PARSER" -e ANTHROPIC_API=1 \
+        -e "WORKERS=$WORKERS" \
         -e DYN_REQUEST_TRACE=1 -e DYN_REQUEST_TRACE_SINKS=jsonl \
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" "$@" "$IMAGE" \
         bash -c "cd /workspace && ./components/src/dynamo/taper_router/run_smoketest_1gpu.sh $policy > /workspace/$OUT_REL/$run/stack.log 2>&1")
-    if ! wait_for 900 grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
+    # N copies load the model concurrently from the same cache: allow longer.
+    if ! wait_for $(( WORKERS > 1 ? 2400 : 900 )) grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
         echo "stack for $run never became ready; see $OUT/$run/stack.log" >&2
         podman stop -t 10 "$CID" >/dev/null || true; exit 1
     fi
@@ -85,7 +94,7 @@ start_probe() {  # start_probe <run>: record every forward pass (read-only)
     local run=$1
     rm -f "$OUT/$run/fpm.jsonl"
     podman exec -d "$CID" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
-        record --port 20081 --out /workspace/$OUT_REL/$run/fpm.jsonl \
+        record --port $FPM_PORTS --out /workspace/$OUT_REL/$run/fpm.jsonl \
         > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
     sleep 10  # idle steps aren't recorded, so check the process, not the file
     podman exec "$CID" pgrep -f fpm_probe.py >/dev/null 2>&1 \
@@ -120,7 +129,8 @@ if [[ "$MODE" == "unloaded" ]]; then
 fi
 
 if [[ "$MODE" == "diag" ]]; then
-    for run in "diag-trunk${DIAG_TAG}" "diag-fanout${DIAG_TAG}"; do
+    for kind in $DIAG_KINDS; do
+        run="diag-$kind$DIAG_TAG"
         if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
         echo "=== $run ($(date -u +%H:%M:%S)) ==="
         start_stack "$run" kv

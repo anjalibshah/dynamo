@@ -53,13 +53,26 @@ export DYN_REQUEST_PLANE=tcp
 export DYN_EVENT_PLANE=zmq
 mkdir -p "$DYN_FILE_KV"
 
-DYN_SYSTEM_PORT=8181 DYN_FORWARDPASS_METRIC_PORT=20081 \
-VLLM_NIXL_SIDE_CHANNEL_PORT=20097 CUDA_VISIBLE_DEVICES="$GPUS" \
-python -m dynamo.vllm \
-    --model "$MODEL_PATH" --served-model-name "$WORKER_MODEL" \
-    --tensor-parallel-size "$TP" --block-size "$BLOCK_SIZE" \
-    --enable-prefix-caching ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
-    --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' &
+# WORKERS=N: N data-parallel copies, worker i on GPU i (TP must be 1). Worker
+# 0 keeps the original ports so 1-GPU runs are unchanged; worker i>0 uses
+# system 8190+i, FPM 20100+i, NIXL side channel 20200+i, KV events 20300+i.
+WORKERS="${WORKERS:-1}"
+if (( WORKERS > 1 && TP != 1 )); then echo "WORKERS>1 needs TP=1" >&2; exit 2; fi
+worker_ports() {  # worker_ports <i> -> "system fpm nixl kvevents"
+    if (( $1 == 0 )); then echo "8181 20081 20097 20080"
+    else echo "$((8190 + $1)) $((20100 + $1)) $((20200 + $1)) $((20300 + $1))"; fi
+}
+for (( i = 0; i < WORKERS; i++ )); do
+    read -r SYS FPM NIXL KVE <<<"$(worker_ports $i)"
+    gpu=$GPUS; (( WORKERS > 1 )) && gpu=$i
+    DYN_SYSTEM_PORT=$SYS DYN_FORWARDPASS_METRIC_PORT=$FPM \
+    VLLM_NIXL_SIDE_CHANNEL_PORT=$NIXL CUDA_VISIBLE_DEVICES="$gpu" \
+    python -m dynamo.vllm \
+        --model "$MODEL_PATH" --served-model-name "$WORKER_MODEL" \
+        --tensor-parallel-size "$TP" --block-size "$BLOCK_SIZE" \
+        --enable-prefix-caching ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
+        --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$KVE\",\"enable_kv_cache_events\":true}" &
+done
 
 if [[ "$POLICY" == "taper" ]]; then
     DYN_SYSTEM_PORT=8183 python -m dynamo.taper_router \
@@ -98,6 +111,12 @@ models() { curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/models" 2>/dev/null; }
 until models | grep -Fq "\"$WORKER_MODEL\"" && models | grep -Fq "\"$MODEL_NAME_ROUTER\""; do
     sleep 5
 done
-echo "$POLICY smoketest stack ready at http://127.0.0.1:${HTTP_PORT}/v1"
+# With several workers, also wait until every one reports ready on its
+# system port (/health: 200 "ready", 503 "notready").
+for (( i = 0; i < WORKERS && WORKERS > 1; i++ )); do
+    read -r SYS _ <<<"$(worker_ports $i)"
+    until curl -fsS "http://127.0.0.1:$SYS/health" >/dev/null 2>&1; do sleep 5; done
+done
+echo "$POLICY smoketest stack ready at http://127.0.0.1:${HTTP_PORT}/v1 (workers=$WORKERS)"
 
 wait_any_exit
