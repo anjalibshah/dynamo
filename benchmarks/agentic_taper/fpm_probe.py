@@ -27,14 +27,15 @@ import sys
 import time
 
 
-def record(port: int, out: str) -> None:
+def record(ports: list[int], out: str) -> None:
     import zmq
 
     from dynamo.common.forward_pass_metrics import decode
 
     sock = zmq.Context.instance().socket(zmq.SUB)
     sock.setsockopt(zmq.SUBSCRIBE, b"")
-    sock.connect(f"tcp://127.0.0.1:{port}")
+    for port in ports:  # one SUB socket fans in every worker's PUB
+        sock.connect(f"tcp://127.0.0.1:{port}")
     last_flush = time.monotonic()
     with open(out, "a") as f:
         while True:
@@ -129,7 +130,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("record")
-    r.add_argument("--port", type=int, default=20081)
+    r.add_argument("--port", default="20081",
+                   help="comma-separated FPM ports, one per worker (e.g. 20081,20101,...)")
     r.add_argument("--out", required=True)
     s = sub.add_parser("summarize")
     s.add_argument("path")
@@ -137,7 +139,7 @@ def main() -> None:
     s.add_argument("--skip-first-s", type=float, default=300.0)
     a = p.parse_args()
     if a.cmd == "record":
-        record(a.port, a.out)
+        record([int(p) for p in str(a.port).split(",") if p], a.out)
     else:
         summarize(a.path, a.slo_ms, a.skip_first_s)
 
