@@ -28,7 +28,10 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-1.5B-Instruct}"
 MODEL_NAME_ROUTER="${MODEL_NAME_ROUTER:-Qwen2.5-1.5B-Instruct}"
 WORKER_MODEL="$MODEL_NAME_ROUTER"
 BLOCK_SIZE=16
-HTTP_PORT=8100
+# PORT_OFFSET: shift every port this script binds (for several independent
+# stacks on one host with --network host; sweep_parallel.sh uses 1000*slot).
+PO="${PORT_OFFSET:-0}"
+HTTP_PORT=$((8100 + PO))
 # Pilot knobs (defaults keep the original 1-GPU Qwen smoke test):
 #   TP=1 GPUS=0 TOOL_PARSER= REASONING_PARSER=  (e.g. glm47 / glm45 for GLM-4.7-Flash)
 #   DYN_REQUEST_TRACE=1 DYN_REQUEST_TRACE_OUTPUT_PATH=...  records session/parent ids
@@ -59,8 +62,8 @@ mkdir -p "$DYN_FILE_KV"
 WORKERS="${WORKERS:-1}"
 if (( WORKERS > 1 && TP != 1 )); then echo "WORKERS>1 needs TP=1" >&2; exit 2; fi
 worker_ports() {  # worker_ports <i> -> "system fpm nixl kvevents"
-    if (( $1 == 0 )); then echo "8181 20081 20097 20080"
-    else echo "$((8190 + $1)) $((20100 + $1)) $((20200 + $1)) $((20300 + $1))"; fi
+    if (( $1 == 0 )); then echo "$((8181 + PO)) $((20081 + PO)) $((20097 + PO)) $((20080 + PO))"
+    else echo "$((8190 + PO + $1)) $((20100 + PO + $1)) $((20200 + PO + $1)) $((20300 + PO + $1))"; fi
 }
 for (( i = 0; i < WORKERS; i++ )); do
     read -r SYS FPM NIXL KVE <<<"$(worker_ports $i)"
@@ -75,7 +78,7 @@ for (( i = 0; i < WORKERS; i++ )); do
 done
 
 if [[ "$POLICY" == "taper" ]]; then
-    DYN_SYSTEM_PORT=8183 python -m dynamo.taper_router \
+    DYN_SYSTEM_PORT=$((8183 + PO)) python -m dynamo.taper_router \
         --endpoint dynamo.backend.generate \
         --model-name "$MODEL_NAME_ROUTER" \
         --model-path "$MODEL_PATH" ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
@@ -87,7 +90,7 @@ if [[ "$POLICY" == "taper" ]]; then
         --shared-cache-type none &
     ROUTER_MODE=round-robin
 elif [[ "$POLICY" == "ta" ]]; then
-    DYN_SYSTEM_PORT=8183 python -m dynamo.thunderagent_router \
+    DYN_SYSTEM_PORT=$((8183 + PO)) python -m dynamo.thunderagent_router \
         --endpoint dynamo.backend.generate \
         --model-name "$MODEL_NAME_ROUTER" \
         --model-path "$MODEL_PATH" ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
@@ -98,7 +101,7 @@ else
     ROUTER_MODE=kv
 fi
 
-DYN_SYSTEM_PORT=8184 python -m dynamo.frontend \
+DYN_SYSTEM_PORT=$((8184 + PO)) python -m dynamo.frontend \
     --http-host 0.0.0.0 \
     --http-port "$HTTP_PORT" \
     --router-mode "$ROUTER_MODE" ${FRONTEND_ARGS[@]+"${FRONTEND_ARGS[@]}"} \
