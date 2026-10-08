@@ -50,9 +50,13 @@ wait_for() { local d=$((SECONDS + $1)); shift; until "$@"; do (( SECONDS < d )) 
 declare -a RUN CID VPID HPID PORT
 cleanup() {  # stop everything this sweep started (also on Ctrl-C)
     for s in "${!SPEC[@]}"; do
+        [[ -n "${HPID[$s]:-}" ]] && pkill -TERM -P "${HPID[$s]}" 2>/dev/null || true
+        [[ -n "${HPID[$s]:-}" ]] && kill "${HPID[$s]}" 2>/dev/null || true
         [[ -n "${VPID[$s]:-}" ]] && kill "${VPID[$s]}" 2>/dev/null || true
         [[ -n "${CID[$s]:-}" ]] && podman stop -t 10 "${CID[$s]}" >/dev/null 2>&1 || true
     done
+    # Harbor's task containers outlive a killed Harbor process.
+    podman ps -aq --filter name=__env-main | xargs -r podman rm -f >/dev/null 2>&1 || true
 }
 trap 'cleanup; exit 130' INT TERM
 
