@@ -40,9 +40,28 @@ CAP_TIMEOUT="${CAP_TIMEOUT:-1.0}"
 VICTIM_MEAN_MS="${VICTIM_MEAN_MS:-2000}"
 ORDER="${ORDER:-kv-r1 taper-r1 taper-r2 kv-r2}"
 INSTR="$REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md"
-OUT_REL="harbor_ab"                  # under $REPO, so the container sees it
+# SUITE separates a model/setup's runs from earlier ones (e.g. SUITE=-mm for
+# MiniMax-M2): outputs go to harbor_ab$SUITE/, Harbor jobs to jobs/harbor-ab$SUITE-<run>.
+SUITE="${SUITE:-}"
+OUT_REL="harbor_ab$SUITE"            # under $REPO, so the container sees it
 OUT="$REPO/$OUT_REL"
-URL=http://127.0.0.1:8100
+JP="harbor-ab$SUITE"                 # Harbor job-name prefix
+# STACK_GPUS: GPUs for this stack ("all", or e.g. "0,1,2,3" for one TP4 copy);
+# PORT_OFFSET shifts every port, so two stacks (e.g. GPUs 0-3 and 4-7, offsets 0
+# and 1000) can run side by side. TP and EXTRA_VLLM_ARGS pass to the launcher.
+STACK_GPUS="${STACK_GPUS:-all}"
+PO="${PORT_OFFSET:-0}"
+TP="${TP:-1}"
+EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
+URL=http://127.0.0.1:$((8100 + PO))
+if [[ "$STACK_GPUS" == all ]]; then
+    DEV_ARGS=(--device nvidia.com/gpu=all); IN_GPUS="${GPUS:-0}"; SMI_IDS=()
+else
+    DEV_ARGS=(); IN_GPUS=""; k=0
+    IFS=, read -r -a _ids <<<"$STACK_GPUS"
+    for g in "${_ids[@]}"; do DEV_ARGS+=(--device "nvidia.com/gpu=$g"); IN_GPUS+="${IN_GPUS:+,}$k"; k=$((k + 1)); done
+    SMI_IDS=(-i "$STACK_GPUS")
+fi
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
 
@@ -53,8 +72,8 @@ DIAG_KINDS="${DIAG_KINDS:-trunk fanout}"   # e.g. DIAG_KINDS=fanout for the scal
 # Scale CONCURRENT and VICTIM_MEAN_MS with it, e.g. WORKERS=8 CONCURRENT=80
 # VICTIM_MEAN_MS=250.
 WORKERS="${WORKERS:-1}"
-FPM_PORTS=20081
-for (( i = 1; i < WORKERS; i++ )); do FPM_PORTS+=",$((20100 + i))"; done
+FPM_PORTS=$((20081 + PO))
+for (( i = 1; i < WORKERS; i++ )); do FPM_PORTS+=",$((20100 + PO + i))"; done
 [[ "$MODE" =~ ^(unloaded|compare|diag)$ ]] || { echo "usage: $0 unloaded|compare|diag" >&2; exit 2; }
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running (podman system service ...)" >&2; exit 2; }
@@ -67,23 +86,24 @@ CC_ENV=(--ae "ANTHROPIC_BASE_URL=$URL" --ae ANTHROPIC_API_KEY=dynamo-local
         --extra-docker-compose "$PLUGINS/pi-plugin/harbor/host-network.yml")
 
 wait_for() { local d=$((SECONDS + $1)); shift; until "$@"; do (( SECONDS < d )) || return 1; sleep 5; done; }
-gpu_idle() { [[ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; }
+gpu_idle() { [[ -z "$(nvidia-smi ${SMI_IDS[@]+"${SMI_IDS[@]}"} --query-compute-apps=pid --format=csv,noheader)" ]]; }
 port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 
 start_stack() {  # start_stack <run> <policy> [extra -e args...]
     local run=$1 policy=$2; shift 2
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl"
-    CID=$(podman run -d --rm --init --network host --device nvidia.com/gpu=all \
+    CID=$(podman run -d --rm --init --network host "${DEV_ARGS[@]}" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" \
         -e "TOOL_PARSER=$TOOL_PARSER" -e "REASONING_PARSER=$REASONING_PARSER" -e ANTHROPIC_API=1 \
-        -e "WORKERS=$WORKERS" \
+        -e "WORKERS=$WORKERS" -e "PORT_OFFSET=$PO" -e "TP=$TP" -e "GPUS=$IN_GPUS" \
+        -e "EXTRA_VLLM_ARGS=$EXTRA_VLLM_ARGS" \
         -e DYN_REQUEST_TRACE=1 -e DYN_REQUEST_TRACE_SINKS=jsonl \
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" "$@" "$IMAGE" \
         bash -c "cd /workspace && ./components/src/dynamo/taper_router/run_smoketest_1gpu.sh $policy > /workspace/$OUT_REL/$run/stack.log 2>&1")
-    # N copies load the model concurrently from the same cache: allow longer.
-    if ! wait_for $(( WORKERS > 1 ? 2400 : 900 )) grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
+    # Several copies, or one large TP model (e.g. MiniMax-M2 from /data), load slowly.
+    if ! wait_for $(( WORKERS > 1 || TP > 1 ? 3600 : 900 )) grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
         echo "stack for $run never became ready; see $OUT/$run/stack.log" >&2
         podman stop -t 10 "$CID" >/dev/null || true; exit 1
     fi
@@ -104,7 +124,7 @@ start_probe() {  # start_probe <run>: record every forward pass (read-only)
 stop_stack() {
     podman stop -t 10 "$CID" >/dev/null || true
     wait_for 180 gpu_idle || { echo "GPU still busy" >&2; exit 1; }
-    wait_for 60 port_free || { echo "port 8100 still bound" >&2; exit 1; }
+    wait_for 60 port_free || { echo "port $((8100 + PO)) still bound" >&2; exit 1; }
 }
 
 harbor_job() {  # harbor_job <job-name> <extra harbor args...>
@@ -115,14 +135,14 @@ harbor_job() {  # harbor_job <job-name> <extra harbor args...>
 
 if [[ "$MODE" == "unloaded" ]]; then
     run=unloaded
-    if [[ -d "$REPO/jobs/harbor-ab-unloaded" ]]; then echo "skip $run (done)"; exit 0; fi
+    if [[ -d "$REPO/jobs/$JP-unloaded" ]]; then echo "skip $run (done)"; exit 0; fi
     echo "=== $run (stock kv) ==="
     start_stack "$run" kv
     "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$URL" --model "$MODEL" \
         --arm unloaded --out "$OUT/$run/victims.jsonl" --n-victims 30 --mean-arrival-ms 3000
     # One task, alone, natural behavior (no instruction): parallel subagents
     # would not be "unloaded".
-    harbor_job harbor-ab-unloaded -i astropy__astropy-12907 -n 1
+    harbor_job "$JP-unloaded" -i astropy__astropy-12907 -n 1
     stop_stack
     "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl"
     exit 0
@@ -131,7 +151,7 @@ fi
 if [[ "$MODE" == "diag" ]]; then
     for kind in $DIAG_KINDS; do
         run="diag-$kind$DIAG_TAG"
-        if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
+        if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "skip $run (done)"; continue; fi
         echo "=== $run ($(date -u +%H:%M:%S)) ==="
         start_stack "$run" kv
         start_probe "$run"
@@ -141,8 +161,8 @@ if [[ "$MODE" == "diag" ]]; then
         VPID=$!
         extra=()
         [[ "$run" == diag-fanout* ]] && extra=(--extra-instruction-path "$INSTR")
-        harbor_job "harbor-ab-$run" -l "$DIAG_TASKS" -n "$CONCURRENT" ${extra[@]+"${extra[@]}"} \
-            || echo "harbor exited non-zero for $run (see jobs/harbor-ab-$run)" >&2
+        harbor_job "$JP-$run" -l "$DIAG_TASKS" -n "$CONCURRENT" ${extra[@]+"${extra[@]}"} \
+            || echo "harbor exited non-zero for $run (see jobs/$JP-$run)" >&2
         kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
         stop_stack
         "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl" | head -4
@@ -154,7 +174,7 @@ fi
 
 for run in $ORDER; do
     arm=${run%-*}         # kv-r1 -> kv, ctx-p1 -> ctx, kv-c2 -> kv
-    if [[ -d "$REPO/jobs/harbor-ab-$run" ]]; then echo "skip $run (done)"; continue; fi
+    if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "skip $run (done)"; continue; fi
     echo "=== $run ($(date -u +%H:%M:%S)) ==="
     case "$arm" in
         kv)    start_stack "$run" kv ;;
@@ -173,8 +193,8 @@ for run in $ORDER; do
         --arm "$arm" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
         --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
     VPID=$!
-    harbor_job "harbor-ab-$run" -l "$N_TASKS" -n "$CONCURRENT" --extra-instruction-path "$INSTR" \
-        || echo "harbor exited non-zero for $run (see jobs/harbor-ab-$run)" >&2
+    harbor_job "$JP-$run" -l "$N_TASKS" -n "$CONCURRENT" --extra-instruction-path "$INSTR" \
+        || echo "harbor exited non-zero for $run (see jobs/$JP-$run)" >&2
     kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
     stop_stack
     "$PY" "$REPO/benchmarks/agentic_taper/trace_fanout.py" "$OUT/$run/trace.jsonl" | head -4

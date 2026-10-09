@@ -41,6 +41,9 @@ TP="${TP:-1}"
 FRONTEND_ARGS=()
 [[ "${ANTHROPIC_API:-0}" == "1" ]] && FRONTEND_ARGS+=(--enable-anthropic-api)
 GPUS="${GPUS:-0}"
+# EXTRA_VLLM_ARGS: extra worker flags, e.g. "--kv-cache-dtype fp8" for MiniMax-M2
+# (as in run_minimax_8xh100.sh). With TP>1 set GPUS to the TP group, e.g. 0,1,2,3.
+read -r -a EXTRA_VLLM <<<"${EXTRA_VLLM_ARGS:-}"
 PARSER_ARGS=()
 [[ -n "${TOOL_PARSER:-}" ]] && PARSER_ARGS+=(--dyn-tool-call-parser "$TOOL_PARSER")
 [[ -n "${REASONING_PARSER:-}" ]] && PARSER_ARGS+=(--dyn-reasoning-parser "$REASONING_PARSER")
@@ -74,6 +77,7 @@ for (( i = 0; i < WORKERS; i++ )); do
         --model "$MODEL_PATH" --served-model-name "$WORKER_MODEL" \
         --tensor-parallel-size "$TP" --block-size "$BLOCK_SIZE" \
         --enable-prefix-caching ${PARSER_ARGS[@]+"${PARSER_ARGS[@]}"} \
+        ${EXTRA_VLLM[@]+"${EXTRA_VLLM[@]}"} \
         --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$KVE\",\"enable_kv_cache_events\":true}" &
 done
 

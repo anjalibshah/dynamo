@@ -40,16 +40,18 @@ def _ts(s: str) -> float:
     return d.replace(tzinfo=dt.timezone.utc).timestamp() * 1000.0  # Harbor stamps are UTC
 
 
-def _job_dir(root: str, run: str) -> str:
-    for d in (os.path.join(root, f"harbor-ab-{run}"),
-              os.path.join(os.path.dirname(os.path.abspath(root)), "jobs", f"harbor-ab-{run}")):
+def _job_dir(root: str, run: str, suite: str = "") -> str:
+    name = f"harbor-ab{suite}-{run}"
+    for d in (os.path.join(root, name),
+              os.path.join(os.path.dirname(os.path.abspath(root)), "jobs", name)):
         if os.path.isdir(d):
             return d
     raise SystemExit(f"no Harbor job dir for {run}")
 
 
-def score_run(root: str, run: str, n_tasks: int, factor: float, anchor: float, ttft_ms: float) -> dict:
-    job = _job_dir(root, run)
+def score_run(root: str, run: str, n_tasks: int, factor: float, anchor: float, ttft_ms: float,
+              suite: str = "") -> dict:
+    job = _job_dir(root, run, suite)
     starts, ends = [], []
     for p in glob.glob(f"{job}/*__*/result.json"):
         a = json.load(open(p)).get("agent_execution") or {}
@@ -102,7 +104,8 @@ def interp(points: list[tuple[float, float]], level: float) -> float | None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sweep", action="append", required=True)
-    p.add_argument("--root", default="harbor_ab")
+    p.add_argument("--suite", default="", help="SUITE used for the runs; write --suite=-mm (with =) for MiniMax-M2")
+    p.add_argument("--root", default=None, help="results dir (default harbor_ab<suite>)")
     p.add_argument("--n-tasks", type=int, default=30)
     p.add_argument("--factor", type=float, default=3.0)
     p.add_argument("--anchor-ms", type=float, default=4.95, help="unloaded interactive ITL")
@@ -111,6 +114,7 @@ def main() -> None:
     p.add_argument("--min-ratio", type=float, default=1.10)
     a = p.parse_args()
     levels = [float(x) for x in a.levels.split(",")]
+    a.root = a.root or f"harbor_ab{a.suite}"
 
     verdicts, solved = [], defaultdict(lambda: [0, 0])
     for tag in a.sweep:
@@ -124,7 +128,7 @@ def main() -> None:
             m = re.match(r"sw.+?-(kv|ctx)-n(\d+)$", run)
             if not m:
                 continue
-            r = score_run(a.root, run, a.n_tasks, a.factor, a.anchor_ms, a.ttft_ms)
+            r = score_run(a.root, run, a.n_tasks, a.factor, a.anchor_ms, a.ttft_ms, a.suite)
             if "error" in r:
                 print(f"{run:22s} {r['error']}")
                 continue
