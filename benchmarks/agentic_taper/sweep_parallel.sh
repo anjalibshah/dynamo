@@ -36,7 +36,7 @@ INSTR="$REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md"
 OUT_REL=harbor_ab
 OUT="$REPO/$OUT_REL"
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
-PY="$REPO/.venv/bin/python3"
+PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
 
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running" >&2; exit 2; }

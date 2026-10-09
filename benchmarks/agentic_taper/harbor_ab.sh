@@ -44,7 +44,7 @@ OUT_REL="harbor_ab"                  # under $REPO, so the container sees it
 OUT="$REPO/$OUT_REL"
 URL=http://127.0.0.1:8100
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
-PY="$REPO/.venv/bin/python3"
+PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
 
 DIAG_TASKS="${DIAG_TASKS:-10}"
 DIAG_TAG="${DIAG_TAG:-}"             # e.g. DIAG_TAG=-n5 CONCURRENT=5 ./harbor_ab.sh diag
