@@ -13,7 +13,7 @@ from dynamo.common.configuration.utils import add_argument, add_negatable_bool_a
 from dynamo.router.args import (
     DynamoRouterArgGroup,
     DynamoRouterConfig,
-    build_aic_perf_config,
+    build_ais_perf_config,
     build_kv_router_config,
 )
 from dynamo.taper_router.gate import TaperConfig
@@ -202,7 +202,7 @@ def parse_args(argv: Optional[list[str]] = None) -> TaperRouterConfig:
 __all__ = [
     "TaperArgGroup",
     "TaperRouterConfig",
-    "build_aic_perf_config",
+    "build_ais_perf_config",
     "build_kv_router_config",
     "parse_args",
 ]

@@ -28,6 +28,8 @@ from typing import Any, Optional
 
 import uvloop
 
+from dynamo.common.utils.token_ids import token_ids_len
+
 from dynamo.llm import (
     KvRouter,
     ModelInput,
@@ -40,7 +42,7 @@ from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.taper_router.args import (
     TaperRouterConfig,
-    build_aic_perf_config,
+    build_ais_perf_config,
     build_kv_router_config,
     parse_args,
 )
@@ -125,7 +127,7 @@ class TaperRouterHandler:
             endpoint=worker_endpoint,
             block_size=self._config.router_block_size,
             kv_router_config=build_kv_router_config(self._config),
-            aic_perf_config=build_aic_perf_config(self._config),
+            ais_perf_config=build_ais_perf_config(self._config),
         )
 
         self._load = LoadSnapshotProvider(worker_endpoint)
@@ -168,7 +170,8 @@ class TaperRouterHandler:
         self._stat_gated_requests += 1
         decision = await self._gate.before_request(
             task_id, request_id, is_trunk=is_trunk,
-            prompt_tokens=len(request.get("token_ids") or ()))
+            # token_ids may arrive packed (u32 bytes); count tokens, not bytes.
+            prompt_tokens=token_ids_len(request.get("token_ids")))
         logger.debug(
             "taper.route path=gated task=%s request=%s protected=%s "
             "was_deferred=%s waited=%.4fs",
