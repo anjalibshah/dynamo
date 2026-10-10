@@ -56,7 +56,14 @@ NGPU=$(nvidia-smi -L | wc -l)
 IN_GPUS=$(seq -s, 0 $((GPUS_PER_SLOT - 1)))
 mkdir -p "$OUT"
 
-wait_for() { local d=$((SECONDS + $1)); shift; until "$@"; do (( SECONDS < d )) || return 1; sleep 5; done; }
+# Ready, or stop waiting early on a fatal worker startup error.
+stack_ready() {
+    if grep -qE "Engine core initialization failed|Insufficient space in /dev/shm|CUDA out of memory|No such file or directory: .*config.json" "$1" 2>/dev/null; then
+        echo "fatal error in $1:" >&2; grep -m3 -E "Engine core initialization failed|Insufficient space in /dev/shm|CUDA out of memory|No such file or directory: .*config.json" "$1" >&2; return 2
+    fi
+    grep -q "smoketest stack ready" "$1" 2>/dev/null
+}
+wait_for() { local d=$((SECONDS + $1)); shift; local rc; while :; do "$@"; rc=$?; (( rc == 0 )) && return 0; (( rc == 2 )) && return 1; (( SECONDS < d )) || return 1; sleep 5; done; }
 
 declare -a RUN CID VPID HPID PORT
 cleanup() {  # stop everything this sweep started (also on Ctrl-C)
@@ -106,7 +113,7 @@ done
 
 for s in "${!SPEC[@]}"; do
     run=${RUN[$s]}; [[ -z "$run" ]] && continue
-    if ! wait_for 3600 grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
+    if ! wait_for 3600 stack_ready "$OUT/$run/stack.log"; then
         echo "slot $s ($run) never became ready; see $OUT/$run/stack.log" >&2; cleanup; exit 1
     fi
 done

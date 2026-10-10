@@ -88,8 +88,16 @@ CC_ENV=(--ae "ANTHROPIC_BASE_URL=$URL" --ae ANTHROPIC_API_KEY=dynamo-local
         --ae "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL" --ae CLAUDE_CODE_ATTRIBUTION_HEADER=0
         --extra-docker-compose "$PLUGINS/pi-plugin/harbor/host-network.yml")
 
-wait_for() { local d=$((SECONDS + $1)); shift; until "$@"; do (( SECONDS < d )) || return 1; sleep 5; done; }
 gpu_idle() { [[ -z "$(nvidia-smi ${SMI_IDS[@]+"${SMI_IDS[@]}"} --query-compute-apps=pid --format=csv,noheader)" ]]; }
+# Ready, or stop waiting early on a fatal worker startup error (the frontend
+# keeps answering health checks after the worker dies).
+stack_ready() {
+    if grep -qE "Engine core initialization failed|Insufficient space in /dev/shm|CUDA out of memory|No such file or directory: .*config.json" "$1" 2>/dev/null; then
+        echo "fatal error in $1:" >&2; grep -m3 -E "Engine core initialization failed|Insufficient space in /dev/shm|CUDA out of memory|No such file or directory: .*config.json" "$1" >&2; return 2
+    fi
+    grep -q "smoketest stack ready" "$1" 2>/dev/null
+}
+wait_for() { local d=$((SECONDS + $1)); shift; local rc; while :; do "$@"; rc=$?; (( rc == 0 )) && return 0; (( rc == 2 )) && return 1; (( SECONDS < d )) || return 1; sleep 5; done; }
 port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 
 start_stack() {  # start_stack <run> <policy> [extra -e args...]
@@ -106,7 +114,7 @@ start_stack() {  # start_stack <run> <policy> [extra -e args...]
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" "$@" "$IMAGE" \
         bash -c "cd /workspace && ./components/src/dynamo/taper_router/run_smoketest_1gpu.sh $policy > /workspace/$OUT_REL/$run/stack.log 2>&1")
     # Several copies, or one large TP model (e.g. MiniMax-M2 from /data), load slowly.
-    if ! wait_for $(( WORKERS > 1 || TP > 1 ? 3600 : 900 )) grep -q "smoketest stack ready" "$OUT/$run/stack.log"; then
+    if ! wait_for $(( WORKERS > 1 || TP > 1 ? 3600 : 900 )) stack_ready "$OUT/$run/stack.log"; then
         echo "stack for $run never became ready; see $OUT/$run/stack.log" >&2
         podman stop -t 10 "$CID" >/dev/null || true; exit 1
     fi
