@@ -44,6 +44,9 @@ OUT_REL="harbor_ab$SUITE"
 OUT="$REPO/$OUT_REL"
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
+# vLLM TP>1 workers share state via /dev/shm; podman's 64 MB default is too
+# small (MiniMax-M2 TP4 needs >160 MB). Harmless for TP1.
+SHM_SIZE="${SHM_SIZE:-32g}"
 
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running" >&2; exit 2; }
@@ -87,7 +90,7 @@ for s in "${!SPEC[@]}"; do
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
     for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=$g"); done
-    CID[$s]=$(podman run -d --rm --init --network host "${dev[@]}" \
+    CID[$s]=$(podman run -d --rm --init --network host "${dev[@]}" --shm-size "$SHM_SIZE" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" -e "GPUS=$IN_GPUS" -e "TP=$GPUS_PER_SLOT" \

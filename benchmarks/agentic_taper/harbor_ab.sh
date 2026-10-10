@@ -64,6 +64,9 @@ else
 fi
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
+# vLLM TP>1 workers share state via /dev/shm; podman's 64 MB default is too
+# small (MiniMax-M2 TP4 needs >160 MB). Harmless for TP1.
+SHM_SIZE="${SHM_SIZE:-32g}"
 
 DIAG_TASKS="${DIAG_TASKS:-10}"
 DIAG_TAG="${DIAG_TAG:-}"             # e.g. DIAG_TAG=-n5 CONCURRENT=5 ./harbor_ab.sh diag
@@ -92,7 +95,7 @@ port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 start_stack() {  # start_stack <run> <policy> [extra -e args...]
     local run=$1 policy=$2; shift 2
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl"
-    CID=$(podman run -d --rm --init --network host "${DEV_ARGS[@]}" \
+    CID=$(podman run -d --rm --init --network host "${DEV_ARGS[@]}" --shm-size "$SHM_SIZE" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" \
