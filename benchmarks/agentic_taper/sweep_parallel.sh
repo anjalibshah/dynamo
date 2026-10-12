@@ -4,7 +4,7 @@
 #
 # Load sweep (NEXT_STEPS 7.3i/7.3j): independent stacks run in parallel, one per
 # slot, each with its own arm and agent concurrency. Slot s uses GPUs
-# s*G .. s*G+G-1 (G = GPUS_PER_SLOT, the TP size) and PORT_OFFSET=1000*s.
+# s*G .. s*G+G-1 (G = GPUS_PER_SLOT, the TP size) and PORT_OFFSET=100*s.
 # MiniMax-M2 TP4: GPUS_PER_SLOT=4 SUITE=-mm MODEL_PATH=MiniMaxAI/MiniMax-M2.7
 #   MODEL=MiniMaxAI/MiniMax-M2 TOOL_PARSER=minimax_m2
 #   REASONING_PARSER=minimax_append_think EXTRA_VLLM_ARGS="--kv-cache-dtype fp8"
@@ -65,6 +65,16 @@ stack_ready() {
 }
 wait_for() { local d=$((SECONDS + $1)); shift; local rc; while :; do "$@"; rc=$?; (( rc == 0 )) && return 0; (( rc == 2 )) && return 1; (( SECONDS < d )) || return 1; sleep 5; done; }
 
+# Fail fast if any port a stack binds is already taken (e.g. node_exporter owns
+# 9100 on the cluster nodes, which is why stacks are offset by 100, not 1000).
+ports_free() {  # ports_free <offset>
+    local po=$1 p busy=()
+    for p in $((8100 + po)) $((8181 + po)) $((8183 + po)) $((8184 + po)) \
+             $((20080 + po)) $((20081 + po)) $((20097 + po)); do
+        ss -ltnH "sport = :$p" 2>/dev/null | grep -q . && busy+=("$p")
+    done
+    (( ${#busy[@]} == 0 )) || { echo "ports already in use for offset $po: ${busy[*]}" >&2; return 1; }
+}
 declare -a RUN CID VPID HPID PORT
 cleanup() {  # stop everything this sweep started (also on Ctrl-C)
     for s in "${!SPEC[@]}"; do
@@ -82,11 +92,9 @@ echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS"
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
     [[ "$arm" == kv || "$arm" == ctx ]] || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; }
-    run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 1000 * s))
+    run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 100 * s))
     if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "slot $s: skip $run (done)"; RUN[$s]=""; continue; fi
-    if curl -fsS "http://127.0.0.1:${PORT[$s]}/v1/models" >/dev/null 2>&1; then
-        echo "slot $s: port ${PORT[$s]} already serving" >&2; cleanup; exit 2
-    fi
+    ports_free $((100 * s)) || { cleanup; exit 2; }
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl" "$OUT/$run/fpm.jsonl"
     extra=()
     policy=kv
@@ -103,7 +111,7 @@ for s in "${!SPEC[@]}"; do
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" -e "GPUS=$IN_GPUS" -e "TP=$GPUS_PER_SLOT" \
         -e "EXTRA_VLLM_ARGS=$EXTRA_VLLM_ARGS" \
         -e "TOOL_PARSER=$TOOL_PARSER" -e "REASONING_PARSER=$REASONING_PARSER" -e ANTHROPIC_API=1 \
-        -e "PORT_OFFSET=$((1000 * s))" \
+        -e "PORT_OFFSET=$((100 * s))" \
         -e DYN_REQUEST_TRACE=1 -e DYN_REQUEST_TRACE_SINKS=jsonl \
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" \
         ${extra[@]+"${extra[@]}"} "$IMAGE" \
@@ -124,7 +132,7 @@ for s in "${!SPEC[@]}"; do
     run=${RUN[$s]}; [[ -z "$run" ]] && continue
     n=${SPEC[$s]##*:}; url="http://127.0.0.1:${PORT[$s]}"
     podman exec -d "${CID[$s]}" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
-        record --port $((20081 + 1000 * s)) --out /workspace/$OUT_REL/$run/fpm.jsonl \
+        record --port $((20081 + 100 * s)) --out /workspace/$OUT_REL/$run/fpm.jsonl \
         > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
     "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$url" --model "$MODEL" \
         --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \

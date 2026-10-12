@@ -48,7 +48,7 @@ OUT="$REPO/$OUT_REL"
 JP="harbor-ab$SUITE"                 # Harbor job-name prefix
 # STACK_GPUS: GPUs for this stack ("all", or e.g. "0,1,2,3" for one TP4 copy);
 # PORT_OFFSET shifts every port, so two stacks (e.g. GPUs 0-3 and 4-7, offsets 0
-# and 1000) can run side by side. TP and EXTRA_VLLM_ARGS pass to the launcher.
+# and 100) can run side by side. Don't use 1000: node_exporter owns 9100. TP and EXTRA_VLLM_ARGS pass to the launcher.
 STACK_GPUS="${STACK_GPUS:-all}"
 PO="${PORT_OFFSET:-0}"
 TP="${TP:-1}"
@@ -100,8 +100,19 @@ stack_ready() {
 wait_for() { local d=$((SECONDS + $1)); shift; local rc; while :; do "$@"; rc=$?; (( rc == 0 )) && return 0; (( rc == 2 )) && return 1; (( SECONDS < d )) || return 1; sleep 5; done; }
 port_free() { ! curl -fsS "$URL/v1/models" >/dev/null 2>&1; }
 
+# Fail fast if any port a stack binds is already taken (e.g. node_exporter owns
+# 9100 on the cluster nodes, which is why stacks are offset by 100, not 1000).
+ports_free() {  # ports_free <offset>
+    local po=$1 p busy=()
+    for p in $((8100 + po)) $((8181 + po)) $((8183 + po)) $((8184 + po)) \
+             $((20080 + po)) $((20081 + po)) $((20097 + po)); do
+        ss -ltnH "sport = :$p" 2>/dev/null | grep -q . && busy+=("$p")
+    done
+    (( ${#busy[@]} == 0 )) || { echo "ports already in use for offset $po: ${busy[*]}" >&2; return 1; }
+}
 start_stack() {  # start_stack <run> <policy> [extra -e args...]
     local run=$1 policy=$2; shift 2
+    ports_free "$PO" || exit 2
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl"
     CID=$(podman run -d --rm --init --network host "${DEV_ARGS[@]}" --shm-size "$SHM_SIZE" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
