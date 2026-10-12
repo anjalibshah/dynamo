@@ -16,7 +16,8 @@
 # arm: kv (stock KV router) or ctx (taper_router, count cap 7 + 300k context
 # budget, unchanged from the 7.3f ctx arm). Every slot gets the same workload as
 # the 1-GPU comparisons: Claude Code + v2 subagent instruction on SWE-bench
-# Verified, N_TASKS tasks, an interactive client at VICTIM_MEAN_MS. Runs are
+# Verified, N_TASKS tasks, natural behavior unless INSTRUCTION is set, an
+# interactive client at VICTIM_MEAN_MS. Runs are
 # named sw<tag>-<arm>-n<agents>; a slot is skipped if its Harbor job exists.
 set -euo pipefail
 
@@ -35,7 +36,15 @@ N_TASKS="${N_TASKS:-30}"
 VICTIM_MEAN_MS="${VICTIM_MEAN_MS:-2000}"
 CTX_THRESHOLD="${CTX_THRESHOLD:-7}"
 CTX_BUDGET="${CTX_BUDGET:-300000}"
-INSTR="$REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md"
+# Natural agent behavior by default. Set INSTRUCTION to a file (e.g.
+# $REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md) to induce
+# parallel subagents, as the GLM runs did.
+INSTRUCTION="${INSTRUCTION:-}"
+INSTR_ARGS=()
+if [[ -n "$INSTRUCTION" ]]; then
+    [[ -f "$INSTRUCTION" ]] || { echo "INSTRUCTION file $INSTRUCTION not found" >&2; exit 2; }
+    INSTR_ARGS=(--extra-instruction-path "$INSTRUCTION")
+fi
 GPUS_PER_SLOT="${GPUS_PER_SLOT:-1}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 SUITE="${SUITE:-}"
@@ -88,7 +97,7 @@ cleanup() {  # stop everything this sweep started (also on Ctrl-C)
 }
 trap 'cleanup; exit 130' INT TERM
 
-echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS"
+echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION:-none (natural)}]"
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
     [[ "$arm" == kv || "$arm" == ctx ]] || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; }
@@ -143,7 +152,7 @@ for s in "${!SPEC[@]}"; do
         --ae "ANTHROPIC_MODEL=$MODEL" --ae "ANTHROPIC_SMALL_FAST_MODEL=$MODEL" \
         --ae "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL" --ae CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
         --extra-docker-compose "$PLUGINS/pi-plugin/harbor/host-network.yml" \
-        --job-name "$JP-$run" -y -l "$N_TASKS" -n "$n" --extra-instruction-path "$INSTR" \
+        --job-name "$JP-$run" -y -l "$N_TASKS" -n "$n" ${INSTR_ARGS[@]+"${INSTR_ARGS[@]}"} \
         > "$OUT/$run/harbor.log" 2>&1) &
     HPID[$s]=$!
     echo "slot $s: $run started ($n agents)"
