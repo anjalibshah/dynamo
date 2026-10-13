@@ -14,7 +14,15 @@
 #   python3 sweep_report.py --sweep s1 [--suite=-mm]            # afterwards
 #
 # arm: kv (stock KV router) or ctx (taper_router, count cap 7 + 300k context
-# budget, unchanged from the 7.3f ctx arm). Every slot gets the same workload as
+# budget, unchanged from the 7.3f ctx arm), or a milestone-1 arm (NEXT_STEPS
+# 7.3m) on taper_router's agentic gate:
+#   eager   stock KV router (the pre-registered "eager" baseline; same as kv)
+#   pass    router mode eager: router hop + telemetry, no holding
+#   cap1    at most 1 in-flight request per task (fan-out serialized)
+#   cap2    at most 2 in-flight requests per task
+#   taper   one protected request per task + slack admission (needs PRED_COEFFS)
+#   shadow  taper decisions counted but never applied (pilot)
+# Every slot gets the same workload as
 # the 1-GPU comparisons: Claude Code + v2 subagent instruction on SWE-bench
 # Verified, N_TASKS tasks, natural behavior unless INSTRUCTION is set, an
 # interactive client at VICTIM_MEAN_MS. Runs are
@@ -36,6 +44,9 @@ N_TASKS="${N_TASKS:-30}"
 VICTIM_MEAN_MS="${VICTIM_MEAN_MS:-2000}"
 CTX_THRESHOLD="${CTX_THRESHOLD:-7}"
 CTX_BUDGET="${CTX_BUDGET:-300000}"
+# Step-time model "a,b,c" (ms; T = a + b*n + c*L) for the taper/shadow arms,
+# from fit_step_model.py on the calibration runs.
+PRED_COEFFS="${PRED_COEFFS:-}"
 # Natural agent behavior by default. Set INSTRUCTION to a file (e.g.
 # $REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md) to induce
 # parallel subagents, as the GLM runs did.
@@ -100,17 +111,26 @@ trap 'cleanup; exit 130' INT TERM
 echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION:-none (natural)}]"
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
-    [[ "$arm" == kv || "$arm" == ctx ]] || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; }
+    case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow) ;;
+        *) echo "bad arm in ${SPEC[$s]}" >&2; exit 2 ;; esac
+    if [[ ( "$arm" == taper || "$arm" == shadow ) && -z "$PRED_COEFFS" ]]; then
+        echo "arm $arm needs PRED_COEFFS=a,b,c" >&2; exit 2
+    fi
     run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 100 * s))
     if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "slot $s: skip $run (done)"; RUN[$s]=""; continue; fi
     ports_free $((100 * s)) || { cleanup; exit 2; }
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl" "$OUT/$run/fpm.jsonl"
     extra=()
     policy=kv
-    if [[ "$arm" == ctx ]]; then
-        policy=taper
-        extra=(-e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET")
-    fi
+    case "$arm" in
+        ctx) policy=taper
+             extra=(-e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET") ;;
+        pass) policy=taper; extra=(-e DYN_TAPER_MODE=eager) ;;
+        cap1|cap2) policy=taper; extra=(-e DYN_TAPER_MODE=cap -e "DYN_TAPER_CAP_K=${arm#cap}") ;;
+        taper|shadow) policy=taper
+             extra=(-e DYN_TAPER_MODE=taper -e "DYN_TAPER_PREDICTOR_COEFFS=$PRED_COEFFS")
+             [[ "$arm" == shadow ]] && extra+=(-e DYN_TAPER_SHADOW_MODE=true) ;;
+    esac
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
     for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=$g"); done

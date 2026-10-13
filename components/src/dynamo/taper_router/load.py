@@ -117,6 +117,41 @@ class LoadSnapshotProvider:
             out[worker_id] = out.get(worker_id, 0) + metrics.scheduled_requests.sum_decode_kv_tokens
         return out
 
+    def step_samples(self) -> dict[int, tuple[tuple[int, ...], int, int, float, int]]:
+        """``{worker_id: (step_key, num_decode, decode_context, wall_ms, num_prefill)}``.
+
+        All fields come from the same latest FPM message(s) of a worker
+        (decode count and context summed, wall time max across dp ranks), so a
+        step-time model can be fit on consistent (n, L, T) triples. ``step_key``
+        (the dp ranks' counter ids) changes whenever a new forward pass is
+        published, letting callers record each step once; ``num_prefill`` lets them
+        keep decode-only steps for the step-time model. Idle heartbeats
+        (wall_time 0) are skipped.
+        """
+        if self._subscriber is None:
+            return {}
+        try:
+            raw = self._subscriber.get_recent_stats()
+        except Exception as exc:
+            logger.debug("LoadSnapshotProvider step_samples error: %s", exc)
+            return {}
+        acc: dict[int, list] = {}
+        for (worker_id_str, _dp_rank), payload in raw.items():
+            try:
+                worker_id = int(worker_id_str)
+            except (ValueError, TypeError):
+                continue
+            metrics = decode_fpm(payload)
+            if metrics is None or not metrics.wall_time:
+                continue
+            a = acc.setdefault(worker_id, [[], 0, 0, 0.0, 0])
+            a[0].append(int(metrics.counter_id))
+            a[1] += metrics.scheduled_requests.num_decode_requests
+            a[2] += metrics.scheduled_requests.sum_decode_kv_tokens
+            a[3] = max(a[3], metrics.wall_time * 1000.0)
+            a[4] += metrics.scheduled_requests.num_prefill_requests
+        return {w: (tuple(sorted(a[0])), a[1], a[2], a[3], a[4]) for w, a in acc.items()}
+
     def iteration_ms(self) -> dict[int, float]:
         """``{worker_id: latest forward-pass wall time in ms}``, max across dp ranks.
 

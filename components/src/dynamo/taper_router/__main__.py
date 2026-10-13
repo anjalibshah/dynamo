@@ -23,8 +23,9 @@ to dispatch, not *where*.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import uvloop
 
@@ -46,6 +47,7 @@ from dynamo.taper_router.args import (
     build_kv_router_config,
     parse_args,
 )
+from dynamo.taper_router.agentic_gate import AgenticTaperGate
 from dynamo.taper_router.gate import TaperGate
 from dynamo.taper_router.load import LoadSnapshotProvider
 
@@ -115,7 +117,11 @@ class TaperRouterHandler:
         self._config = config
         self._kv_router: Optional[KvRouter] = None
         self._load: Optional[LoadSnapshotProvider] = None
-        self._gate: Optional[TaperGate] = None
+        self._gate: Optional[Union[TaperGate, AgenticTaperGate]] = None
+        self._agentic = config.taper_mode != "legacy"
+        # Session ids repeat across a session's requests; the agentic gate
+        # tracks each in-flight request, so it gets a unique key per call.
+        self._request_seq = itertools.count()
         self._stat_requests_total = 0
         self._stat_gated_requests = 0
         self._stat_passthrough_requests = 0
@@ -133,12 +139,16 @@ class TaperRouterHandler:
         self._load = LoadSnapshotProvider(worker_endpoint)
         self._load.start()
 
-        self._gate = TaperGate(load=self._load, config=self._config.to_taper_config())
+        if self._agentic:
+            self._gate = AgenticTaperGate(load=self._load, config=self._config.to_mode_config())
+        else:
+            self._gate = TaperGate(load=self._load, config=self._config.to_taper_config())
         self._gate.start()
         logger.info(
-            "TAPER Router initialized (worker_endpoint=%s, block_size=%s, shadow_mode=%s)",
+            "TAPER Router initialized (worker_endpoint=%s, block_size=%s, mode=%s, shadow_mode=%s)",
             self._config.endpoint,
             self._config.router_block_size,
+            self._config.taper_mode,
             self._config.shadow_mode,
         )
 
@@ -168,10 +178,17 @@ class TaperRouterHandler:
             return
 
         self._stat_gated_requests += 1
-        decision = await self._gate.before_request(
-            task_id, request_id, is_trunk=is_trunk,
-            # token_ids may arrive packed (u32 bytes); count tokens, not bytes.
-            prompt_tokens=token_ids_len(request.get("token_ids")))
+        # token_ids may arrive packed (u32 bytes); count tokens, not bytes.
+        prompt_tokens = token_ids_len(request.get("token_ids"))
+        request_key = request_id
+        if self._agentic:
+            request_key = f"{request_id}#{next(self._request_seq)}"
+            decision = await self._gate.before_request(
+                task_id, request_key, is_trunk=is_trunk, prompt_tokens=prompt_tokens,
+                is_interactive=request_id.startswith(self._config.interactive_session_prefix))
+        else:
+            decision = await self._gate.before_request(
+                task_id, request_id, is_trunk=is_trunk, prompt_tokens=prompt_tokens)
         logger.debug(
             "taper.route path=gated task=%s request=%s protected=%s "
             "was_deferred=%s waited=%.4fs",
@@ -184,7 +201,11 @@ class TaperRouterHandler:
             ):
                 yield chunk
         finally:
-            await self._gate.after_request(task_id, protected=decision.protected)
+            if self._agentic:
+                await self._gate.after_request(
+                    task_id, protected=decision.protected, request_id=request_key)
+            else:
+                await self._gate.after_request(task_id, protected=decision.protected)
 
     async def status(self, request: Optional[dict[str, Any]] = None):
         gate_status = await self._gate.status_snapshot() if self._gate is not None else None

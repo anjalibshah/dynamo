@@ -105,3 +105,18 @@ def test_snapshot_returns_empty_on_subscriber_error():
     provider = LoadSnapshotProvider(endpoint=None)  # type: ignore[arg-type]
     provider._subscriber = _RaisingSubscriber()  # type: ignore[assignment]
     assert provider.snapshot() == {}
+
+
+def test_step_samples_pairs_load_with_wall_time_and_skips_idle_heartbeats():
+    def step_fpm(worker: str, dp_rank: int, counter: int, n: int, tokens: int, wall_s: float) -> bytes:
+        return encode(ForwardPassMetrics(
+            worker_id=worker, dp_rank=dp_rank, counter_id=counter, wall_time=wall_s,
+            scheduled_requests=ScheduledRequestMetrics(
+                num_decode_requests=n, sum_decode_kv_tokens=tokens)))
+
+    provider = _make_provider({
+        ("1", 0): step_fpm("1", 0, 41, 6, 90_000, 0.012),
+        ("1", 1): step_fpm("1", 1, 40, 4, 60_000, 0.014),
+        ("2", 0): step_fpm("2", 0, 7, 0, 0, 0.0),  # idle heartbeat
+    })
+    assert provider.step_samples() == {1: ((40, 41), 10, 150_000, 14.0, 0)}

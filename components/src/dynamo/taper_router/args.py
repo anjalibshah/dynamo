@@ -16,6 +16,7 @@ from dynamo.router.args import (
     build_ais_perf_config,
     build_kv_router_config,
 )
+from dynamo.taper_router.agentic_gate import MODES, TaperModeConfig
 from dynamo.taper_router.gate import TaperConfig
 
 
@@ -29,6 +30,15 @@ class TaperRouterConfig(DynamoRouterConfig):
     admit_settle_seconds: float
     max_release_per_tick: int
     context_budget_tokens: float = 0.0
+    taper_mode: str = "legacy"
+    cap_k: int = 1
+    rho: float = 0.8
+    tpot_interactive_ms: float = 18.48
+    tpot_agent_ms: float = 21.63
+    predictor_coeffs: str = "0,0,0"
+    online_refit: bool = True
+    max_hold_seconds: float = 60.0
+    interactive_session_prefix: str = "victim-"
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -45,8 +55,42 @@ class TaperRouterConfig(DynamoRouterConfig):
             context_budget_tokens=self.context_budget_tokens,
         )
 
+    def parsed_coeffs(self) -> tuple[float, float, float]:
+        parts = [float(x) for x in self.predictor_coeffs.split(",")]
+        if len(parts) != 3:
+            raise ValueError("--predictor-coeffs must be 'a,b,c' (ms, ms/request, ms/token)")
+        return parts[0], parts[1], parts[2]
+
+    def to_mode_config(self) -> TaperModeConfig:
+        a, b, c = self.parsed_coeffs()
+        return TaperModeConfig(
+            mode=self.taper_mode,
+            cap_k=self.cap_k,
+            rho=self.rho,
+            tpot_interactive_ms=self.tpot_interactive_ms,
+            tpot_agent_ms=self.tpot_agent_ms,
+            pred_a_ms=a,
+            pred_b_ms=b,
+            pred_c_ms=c,
+            online_refit=self.online_refit,
+            permit_window_seconds=self.admit_settle_seconds,
+            max_hold_seconds=self.max_hold_seconds,
+            reconcile_interval_seconds=self.reconcile_interval_seconds,
+            max_release_per_tick=self.max_release_per_tick,
+            shadow_mode=self.shadow_mode,
+        )
+
     def validate(self) -> None:  # type: ignore[override]
         super().validate()
+        if self.taper_mode not in ("legacy",) + MODES:
+            raise ValueError(f"--taper-mode must be one of legacy, {', '.join(MODES)}")
+        if self.cap_k < 1:
+            raise ValueError("--cap-k must be >= 1")
+        if not 0.0 <= self.rho <= 1.0:
+            raise ValueError("--rho must be in [0, 1]")
+        if self.max_hold_seconds <= 0:
+            raise ValueError("--max-hold-seconds must be > 0")
+        self.parsed_coeffs()
         if self.load_threshold <= 0:
             raise ValueError("--load-threshold must be > 0")
         if self.admit_settle_seconds < 0:
@@ -132,6 +176,88 @@ class TaperArgGroup(ArgGroup):
             "to the context at which step time reaches the interactive ITL "
             "SLO (fpm_probe.py summarize reports it). 0 disables (default: 0).",
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--taper-mode",
+            env_var="DYN_TAPER_MODE",
+            default="legacy",
+            help="Admission policy: legacy (the original trunk-protected count/"
+            "context gate, gate.py), eager (admit everything, telemetry only), "
+            "cap (at most --cap-k in-flight requests per task), taper (one "
+            "protected request per task plus slack-budgeted opportunistic "
+            "admission, agentic_gate.py) (default: legacy).",
+            arg_type=str,
+        )
+        add_argument(
+            g,
+            flag_name="--cap-k",
+            env_var="DYN_TAPER_CAP_K",
+            default=1,
+            help="cap mode: in-flight requests allowed per task (default: 1).",
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--rho",
+            env_var="DYN_TAPER_RHO",
+            default=0.8,
+            help="taper mode: fraction of the slack budget opportunistic "
+            "admissions may consume (paper default: 0.8).",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--tpot-interactive-ms",
+            env_var="DYN_TAPER_TPOT_INTERACTIVE_MS",
+            default=18.48,
+            help="taper mode: per-token target while interactive requests "
+            "are in flight (default: 18.48).",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--tpot-agent-ms",
+            env_var="DYN_TAPER_TPOT_AGENT_MS",
+            default=21.63,
+            help="taper mode: per-token target otherwise (default: 21.63).",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--predictor-coeffs",
+            env_var="DYN_TAPER_PREDICTOR_COEFFS",
+            default="0,0,0",
+            help="taper mode: step-time model T = a + b*n + c*L as 'a,b,c' "
+            "(ms; n = decode requests, L = decode context tokens). All zero "
+            "means uncalibrated: admit until the online refit has data.",
+            arg_type=str,
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--online-refit",
+            env_var="DYN_TAPER_ONLINE_REFIT",
+            default=True,
+            help="taper mode: refit the step-time model from live forward-pass "
+            "metrics, as PACE does (default: true).",
+        )
+        add_argument(
+            g,
+            flag_name="--max-hold-seconds",
+            env_var="DYN_TAPER_MAX_HOLD_SECONDS",
+            default=60.0,
+            help="eager/cap/taper modes: longest a request is held before a "
+            "forced admit (default: 60.0). legacy uses --defer-timeout-seconds.",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--interactive-session-prefix",
+            env_var="DYN_TAPER_INTERACTIVE_SESSION_PREFIX",
+            default="victim-",
+            help="Session ids with this prefix are interactive traffic: they "
+            "select the tighter per-token target (default: victim-).",
+            arg_type=str,
         )
         add_negatable_bool_argument(
             g,

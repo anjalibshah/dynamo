@@ -48,3 +48,21 @@ def test_release_smoothing_defaults_and_overrides(monkeypatch):
     assert (ns.admit_settle_seconds, ns.max_release_per_tick) == (0.5, 4)
     ns = _parse(["--admit-settle-seconds", "0.25", "--max-release-per-tick", "8"])
     assert (ns.admit_settle_seconds, ns.max_release_per_tick) == (0.25, 8)
+
+
+def test_agentic_flags_default_to_legacy_gate(monkeypatch):
+    for v in ("DYN_TAPER_MODE", "DYN_TAPER_PREDICTOR_COEFFS", "DYN_TAPER_ONLINE_REFIT"):
+        monkeypatch.delenv(v, raising=False)
+    ns = _parse([])
+    assert ns.taper_mode == "legacy"
+    assert ns.predictor_coeffs == "0,0,0"
+    assert ns.online_refit is True
+    assert ns.interactive_session_prefix == "victim-"
+
+
+def test_agentic_flags_from_env(monkeypatch):
+    monkeypatch.setenv("DYN_TAPER_MODE", "cap")
+    monkeypatch.setenv("DYN_TAPER_CAP_K", "2")
+    monkeypatch.setenv("DYN_TAPER_PREDICTOR_COEFFS", "6.0,0.12,7.5e-6")
+    ns = _parse([])
+    assert (ns.taper_mode, ns.cap_k, ns.predictor_coeffs) == ("cap", 2, "6.0,0.12,7.5e-6")
