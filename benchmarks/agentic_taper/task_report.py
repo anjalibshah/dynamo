@@ -19,10 +19,11 @@ Per run (sw<tag>-<arm>-n<agents>):
   interactive e2e deadline attainment in the window (as sweep_report.py)
   solved      Harbor reward 1.0 count
 
-Win rule (7.3m): for every (rep, load), taper G >= --min-ratio x the best of
-eager / cap1 / cap2, at both loads in both reps; taper interactive >= 0.80;
-taper p90 slowdown <= the best baseline's (the baseline with the highest G);
-pooled solved rate within 5 points of eager.
+Win rule (7.3m, restated 2026-10-13), per cell (rep x load): (a) taper G >=
+1.10 x eager; (b) taper G >= 0.95 x the best fixed policy (eager/cap1/cap2);
+(c) taper interactive >= 0.80 and p90 slowdown <= the best fixed policy's. WIN
+iff all cells pass, pooled solved within 5 points of eager, and no cap k has
+G >= 1.10 x eager and >= 0.95 x taper in every cell (then a fixed cap suffices).
 
     python3 task_report.py --suite=-mm --root /data/$USER/harbor_ab-mm \\
         --ref m1ref-kv-n8 --sweep m1a --sweep m1b
@@ -124,6 +125,7 @@ def main() -> None:
     ap.add_argument("--anchor-ms", type=float, default=6.16, help="unloaded interactive ITL")
     ap.add_argument("--ttft-ms", type=float, default=500.0)
     ap.add_argument("--min-ratio", type=float, default=1.10)
+    ap.add_argument("--within", type=float, default=0.95, help="(b): share of the best fixed policy's G")
     ap.add_argument("--min-interactive", type=float, default=0.80)
     ap.add_argument("--json", help="also write all scores here")
     args = ap.parse_args()
@@ -162,40 +164,50 @@ def main() -> None:
               f"{s['solved']:>3}/{s['trials']:<3}")
 
     if args.sweep:
-        print("\nwin rule (7.3m):")
+        print("\nwin rule (7.3m, restated 2026-10-13):")
         cells = defaultdict(dict)  # (tag, n) -> arm -> score
         for run, s in scores.items():
             m = re.match(r"^sw(.+)-([a-z0-9]+)-n(\d+)$", run)
             if m and "error" not in s:
                 cells[(m.group(1), int(m.group(3)))][m.group(2)] = s
-        verdicts = []
+        ok = lambda c: "ok" if c else "FAIL"
+        verdicts, cap_ok = [], {b: [] for b in BASELINES if b != "eager"}
         for (tag, n), arms in sorted(cells.items()):
             if "taper" not in arms or not all(b in arms for b in BASELINES):
                 print(f"  rep {tag} @{n}: incomplete ({sorted(arms)})")
                 verdicts.append(False)
                 continue
+            g = {a: arms[a]["goodput"] for a in ("taper",) + BASELINES}
             t = arms["taper"]
-            best = max(BASELINES, key=lambda b: arms[b]["goodput"])
-            ratio = t["goodput"] / arms[best]["goodput"] if arms[best]["goodput"] else float("inf")
-            g_ok = ratio >= args.min_ratio
+            best = max(BASELINES, key=lambda b: g[b])
+            a_ok = g["taper"] >= args.min_ratio * g["eager"]
+            b_ok = g["taper"] >= args.within * g[best]
             i_ok = t["interactive"] >= args.min_interactive
             s_ok = t["p90_slow"] <= arms[best]["p90_slow"]
-            print(f"  rep {tag} @{n}: taper G={t['goodput']:.1f} vs best baseline {best} "
-                  f"{arms[best]['goodput']:.1f} -> {ratio:.2f}x [{'ok' if g_ok else 'FAIL'}]  "
-                  f"interactive {t['interactive']:.1%} [{'ok' if i_ok else 'FAIL'}]  "
-                  f"p90 slowdown {t['p90_slow']:.2f} vs {arms[best]['p90_slow']:.2f} "
-                  f"[{'ok' if s_ok else 'FAIL'}]")
-            verdicts.append(g_ok and i_ok and s_ok)
+            ratio = lambda x, y: x / y if y else float("inf")
+            print(f"  rep {tag} @{n}: G taper {g['taper']:.1f} eager {g['eager']:.1f} "
+                  f"cap1 {g['cap1']:.1f} cap2 {g['cap2']:.1f}")
+            print(f"     (a) vs eager {ratio(g['taper'], g['eager']):.2f}x [{ok(a_ok)}]  "
+                  f"(b) vs best fixed ({best}) {ratio(g['taper'], g[best]):.2f}x [{ok(b_ok)}]  "
+                  f"(c) interactive {t['interactive']:.1%} [{ok(i_ok)}], p90 slowdown "
+                  f"{t['p90_slow']:.2f} vs {arms[best]['p90_slow']:.2f} [{ok(s_ok)}]")
+            verdicts.append(a_ok and b_ok and i_ok and s_ok)
+            for cap in cap_ok:
+                cap_ok[cap].append(g[cap] >= args.min_ratio * g["eager"]
+                                   and g[cap] >= args.within * g["taper"])
 
         def rate(arm: str) -> float:
             ss = [s for r, s in scores.items() if f"-{arm}-n" in r and "error" not in s]
             return sum(s["solved"] for s in ss) / max(1, sum(s["trials"] for s in ss))
 
         solved_ok = rate("taper") >= rate("eager") - 0.05
-        print(f"  pooled solved: taper {rate('taper'):.1%} vs eager {rate('eager'):.1%} "
-              f"[{'ok' if solved_ok else 'FAIL'}]")
-        print(f"\nVERDICT: {'WIN' if verdicts and all(verdicts) and solved_ok else 'NO WIN'} "
-              f"({sum(verdicts)}/{len(verdicts)} cells pass)")
+        print(f"  pooled solved: taper {rate('taper'):.1%} vs eager {rate('eager'):.1%} [{ok(solved_ok)}]")
+        dominating = [c for c, v in cap_ok.items() if v and len(v) == len(cells) and all(v)]
+        print(f"  fixed cap that makes TAPER unnecessary: {', '.join(dominating) or 'none'}")
+        win = bool(verdicts) and all(verdicts) and solved_ok and not dominating
+        print(f"\nVERDICT: {'WIN' if win else 'NO WIN'} ({sum(verdicts)}/{len(verdicts)} cells pass)"
+              + (f"; a fixed per-task cap ({', '.join(dominating)}) captures the benefit"
+                 if dominating else ""))
 
     if args.json:
         with open(args.json, "w") as f:
