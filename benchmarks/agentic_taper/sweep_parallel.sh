@@ -22,6 +22,10 @@
 #   cap2    at most 2 in-flight requests per task
 #   taper   one protected request per task + slack admission (needs PRED_COEFFS)
 #   shadow  taper decisions counted but never applied (pilot)
+# AGENT selects the coding agent (Harbor -a): claude-code (default), opencode
+# (OpenCode, pinned OC_VERSION, default prompt and subagents), or omo (OpenCode
+# plus the oh-my-opencode plugin, pinned OMO_VERSION, ultrawork on by default
+# via its config so no prompt keyword is needed; every agent/category -> MODEL).
 # Every slot gets the same workload as
 # the 1-GPU comparisons: Claude Code + v2 subagent instruction on SWE-bench
 # Verified, N_TASKS tasks, natural behavior unless INSTRUCTION is set, an
@@ -47,6 +51,10 @@ CTX_BUDGET="${CTX_BUDGET:-300000}"
 # Step-time model "a,b,c" (ms; T = a + b*n + c*L) for the taper/shadow arms,
 # from fit_step_model.py on the calibration runs.
 PRED_COEFFS="${PRED_COEFFS:-}"
+AGENT="${AGENT:-claude-code}"
+OC_VERSION="${OC_VERSION:-1.19.0}"     # 1.19.0 sends each subagent's own x-session-id
+OMO_VERSION="${OMO_VERSION:-5.1.32}"
+case "$AGENT" in claude-code|opencode|omo) ;; *) echo "bad AGENT=$AGENT" >&2; exit 2 ;; esac
 # Natural agent behavior by default. Set INSTRUCTION to a file (e.g.
 # $REPO/benchmarks/agentic_taper/harbor_parallel_subagents_v2.md) to induce
 # parallel subagents, as the GLM runs did.
@@ -167,10 +175,26 @@ for s in "${!SPEC[@]}"; do
         --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
         --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
     VPID[$s]=$!
-    (cd "$REPO" && "$HARBOR" run -d swebench-verified@1.0 -a claude-code -m "$MODEL" \
-        --ae "ANTHROPIC_BASE_URL=$url" --ae ANTHROPIC_API_KEY=dynamo-local \
-        --ae "ANTHROPIC_MODEL=$MODEL" --ae "ANTHROPIC_SMALL_FAST_MODEL=$MODEL" \
-        --ae "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL" --ae CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
+    if [[ "$AGENT" == claude-code ]]; then
+        agent_args=(-a claude-code -m "$MODEL"
+            --ae "ANTHROPIC_BASE_URL=$url" --ae ANTHROPIC_API_KEY=dynamo-local
+            --ae "ANTHROPIC_MODEL=$MODEL" --ae "ANTHROPIC_SMALL_FAST_MODEL=$MODEL"
+            --ae "CLAUDE_CODE_SUBAGENT_MODEL=$MODEL" --ae CLAUDE_CODE_ATTRIBUTION_HEADER=0)
+    else
+        # OpenCode talks OpenAI chat completions to the frontend; Dynamo maps its
+        # x-session-id / x-parent-session-id headers to the task identity.
+        oc_cfg=$("$PY" "$REPO/benchmarks/agentic_taper/opencode_config.py" opencode \
+            --base-url "$url/v1" --model "$MODEL" \
+            $( [[ "$AGENT" == omo ]] && echo --omo-version "$OMO_VERSION" ))
+        agent_args=(-a opencode -m "dynamo/$MODEL" --ak "version=$OC_VERSION"
+            --ak "opencode_config=$oc_cfg")
+        if [[ "$AGENT" == omo ]]; then
+            "$PY" "$REPO/benchmarks/agentic_taper/opencode_config.py" omo --model "$MODEL" \
+                > "$OUT/$run/oh-my-opencode.json"
+            agent_args+=(--mounts "[\"$OUT/$run/oh-my-opencode.json:/root/.config/opencode/oh-my-opencode.json:ro\"]")
+        fi
+    fi
+    (cd "$REPO" && "$HARBOR" run -d swebench-verified@1.0 "${agent_args[@]}" \
         --extra-docker-compose "$PLUGINS/pi-plugin/harbor/host-network.yml" \
         --job-name "$JP-$run" -y -l "$N_TASKS" -n "$n" ${INSTR_ARGS[@]+"${INSTR_ARGS[@]}"} \
         > "$OUT/$run/harbor.log" 2>&1) &
