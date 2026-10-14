@@ -513,6 +513,20 @@ def update_engine_config_with_dynamo(
             dynamo_config.benchmark_output_path,
         )
 
+    if os.environ.get("DYN_TAPER_ENGINE", "off").strip().lower() not in ("", "off"):
+        # TaperScheduler subclasses InstrumentedScheduler, so forward pass
+        # metrics and benchmark mode keep working when it replaces that default.
+        existing_cls = getattr(engine_config, "scheduler_cls", None)
+        if existing_cls is None:
+            defaults["scheduler_cls"] = "dynamo.vllm.taper_scheduler.TaperScheduler"
+            logger.info("DYN_TAPER_ENGINE set: scheduler_cls set to TaperScheduler")
+        elif "TaperScheduler" not in str(existing_cls):
+            raise ValueError(
+                f"DYN_TAPER_ENGINE requires TaperScheduler but --scheduler-cls is "
+                f"set to '{existing_cls}'. Remove --scheduler-cls or unset "
+                f"DYN_TAPER_ENGINE."
+            )
+
     logger.debug("Setting Dynamo defaults for vLLM")
     for key, value in defaults.items():
         if hasattr(engine_config, key):

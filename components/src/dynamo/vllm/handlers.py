@@ -93,6 +93,8 @@ from dynamo.vllm.kv_connector_protocols import (
     make_kv_connector_protocol,
 )
 from dynamo.vllm.kv_hints import publish_kv_hint_capabilities
+from dynamo.vllm.taper_engine import TaperConfig
+from dynamo.vllm.taper_engine import attach_identity as attach_taper_identity
 
 from .args import Config
 from .cache_info import get_configured_kv_event_block_size
@@ -938,11 +940,18 @@ def build_sampling_params(
     # bridge pressure before chunks cross into Dynamo.
     sampling_params.detokenize = False
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
+    # Agentic TAPER (DYN_TAPER_ENGINE): task identity for TaperScheduler.
+    attach_taper_identity(sampling_params, request, _taper_config())
 
     # setattr skips __post_init__ (temperature clamp, _verify_args, greedy reset),
     # and vLLM validates before the process_inputs clone reruns it.
     sampling_params.__post_init__()
     return sampling_params
+
+
+@functools.cache
+def _taper_config() -> TaperConfig:
+    return TaperConfig.from_env()
 
 
 def _update_kv_transfer_params(
