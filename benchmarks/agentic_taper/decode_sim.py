@@ -30,11 +30,17 @@ taper_engine.py), loaded by file path, run at each --rhos value:
   stock        every active request decodes every step (vLLM eager)
   class_blind  HyGen/BROS-style: interactive always, agents by fit
   role_aware   ours: plus the task critical path protected
-  oracle       role_aware with perfect knowledge (simulation only): per task,
-               protect the request whose session has the most decode work left
-               (this request's remaining tokens + the session's later
-               requests), and demote the least such work first. An upper bound
-               on what task-aware selection can add over class_blind here
+  oracle       task-aware with perfect knowledge (simulation only). A request's
+               work left = its remaining tokens + its session's later requests;
+               a task's = the most among its running requests. Per task the
+               request with the most work left (the critical path) is
+               protected; across tasks the one with the most work left is
+               demoted first and the rest fill shortest-task-first, a task's
+               non-critical requests last (SRPT over tasks)
+  oracle_blind the same knowledge without task structure: no protection,
+               shortest-remaining request first. oracle vs oracle_blind is
+               what task structure adds; both vs class_blind what size
+               knowledge adds
 
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
@@ -231,20 +237,24 @@ def fit_prefill(path: str, coeffs: tuple, max_ms: float = 1000.0) -> dict | None
 # ---------------------------------------------------------------------------
 
 
-def oracle_policy(eng, cfg):
+def oracle_policy(eng, cfg, task_aware: bool):
     class OraclePolicy(eng.TaperPolicy):
-        """Protects, per task, the request with the most session work left."""
-
-        remaining: dict = {}
+        remaining: dict = {}  # req -> decode work left in its session
+        task_rem: dict = {}  # task -> most work left among its running requests
 
         def _protected(self, by_task: dict) -> set:
             return {max(cs, key=lambda c: (self.remaining[c.req_id], c.req_id)).req_id
                     for cs in by_task.values()}
 
         def _demote_key(self, c) -> tuple:
+            return (-self.task_rem[c.task], c.req_id)
+
+        def _fill_key(self, c, straggler_tasks) -> tuple:
+            if task_aware:
+                return (self.task_rem[c.task], -self.remaining[c.req_id], c.req_id)
             return (self.remaining[c.req_id], c.req_id)
 
-    cfg.mode = "role_aware"
+    cfg.mode = "role_aware" if task_aware else "class_blind"
     return OraclePolicy(cfg)
 
 
@@ -254,8 +264,8 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
     pol = None
-    if policy == "oracle":
-        pol = oracle_policy(eng, cfg)
+    if policy in ("oracle", "oracle_blind"):
+        pol = oracle_policy(eng, cfg, policy == "oracle")
     elif policy != "stock":
         cfg.mode = policy
         pol = eng.TaperPolicy(cfg)
@@ -298,8 +308,12 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
             cands = [eng.Cand(req_id=r.i, ctx=ctx[r.i], interactive=r.interactive,
                               task=r.task, role=r.role, decoded=r.need - left[r.i] + 1)
                      for r in active.values()]
-            if policy == "oracle":
+            if pol.__class__.__name__ == "OraclePolicy":
                 pol.remaining = {i: left[i] + reqs[i].future for i in active}
+                pol.task_rem = defaultdict(int)
+                for i, w in pol.remaining.items():
+                    tk = reqs[i].task
+                    pol.task_rem[tk] = max(pol.task_rem[tk], w)
             d = pol.decide(cands, min(pending_prefill, budget))
             skip = d.skip
             engaged += d.engaged
@@ -422,7 +436,7 @@ def matched(rows: dict, levels: list[float]) -> list[str]:
     """Per interactive level: each policy's best task p90 among rhos reaching it."""
     out = []
     pols = sorted({p for p, _ in rows if p != "stock"},
-                  key=lambda p: ("class_blind", "role_aware", "oracle").index(p))
+                  key=lambda p: ("class_blind", "role_aware", "oracle", "oracle_blind").index(p))
     for lv in levels:
         best = {}
         for pol in pols:
@@ -458,7 +472,7 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=0,
                     help="step token budget; default: from fpm.jsonl, else 8192")
     ap.add_argument("--rhos", default="0.6,0.8,1.0")
-    ap.add_argument("--policies", default="class_blind,role_aware,oracle")
+    ap.add_argument("--policies", default="class_blind,role_aware,oracle,oracle_blind")
     ap.add_argument("--levels", default="0.5,0.8,0.9,0.95")
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--max-opp-ctx", type=int, default=0)
@@ -535,7 +549,7 @@ def main() -> None:
                 sim = simulate(reqs, pol, eng, cfg, budget, a.noise, a.seed, closed)
                 rows[(pol, rho)] = score(reqs, sim, stock, a.factor, a.anchor_ms, a.ttft_ms)
         for (pol, rho), s in rows.items():
-            label = pol if pol == "stock" else f"{pol[:11]} {rho:g}"
+            label = pol if pol == "stock" else f"{pol[:12]} {rho:g}"
             print(f"   {label:<15} {s['on']:>8.1%} {s['itl50']:>6.1f}/{s['itl90']:<6.1f} "
                   f"{s['ttft90']:>8.0f} {s['main50']:>7.2f}/{s['main90']:<7.2f} "
                   f"{s['sub50']:>6.2f}/{s['sub90']:<7.2f} {s['task90']:>8.2f} {s['t80']:>5.2f} "

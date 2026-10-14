@@ -273,6 +273,10 @@ class TaperPolicy:
                 out.add(max(cs, key=lambda c: (c.decoded, c.req_id)).req_id)
         return out
 
+    def _fill_key(self, c: Cand, straggler_tasks: set) -> tuple:
+        """Order in which opportunistic requests are offered the step's slack."""
+        return (-c.skip_run, 0 if c.task in straggler_tasks else 1, c.ctx, c.req_id)
+
     def _demote_key(self, c: Cand) -> tuple:
         """Order in which protected requests lose protection: most context first."""
         return (-c.ctx, c.req_id)
@@ -334,12 +338,7 @@ class TaperPolicy:
         }
         order = sorted(
             (c for c in managed if c.req_id not in base_ids),
-            key=lambda c: (
-                -c.skip_run,
-                0 if c.task in straggler_tasks else 1,
-                c.ctx,
-                c.req_id,
-            ),
+            key=lambda c: self._fill_key(c, straggler_tasks),
         )
         for c in order:
             guard_ok = (
