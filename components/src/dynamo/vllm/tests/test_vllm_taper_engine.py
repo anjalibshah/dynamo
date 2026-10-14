@@ -293,3 +293,34 @@ def test_step_timing_ignores_empty_outputs():
     assert len(s._taper_pending) == 1
     s.update_from_output(out, None)
     assert not s._taper_pending
+
+
+def test_fan_out_protects_largest_context_subagent():
+    p = TaperPolicy(cfg())
+    cs = cands(main=False, n_subs=12)
+    cs[5].ctx = 300_000
+    skips = {c.req_id: 0 for c in cs}
+    for _ in range(40):
+        for rid in p.decide(cs).skip:
+            skips[rid] += 1
+    others = [v for k, v in skips.items() if k not in ("chat", "s4")]
+    # cs[5] is s4; forced requests outrank it, so it is demoted only sometimes
+    assert skips["s4"] < min(others)
+
+
+def test_protected_requests_demoted_when_they_break_the_target():
+    p = TaperPolicy(cfg())
+    # 12 tasks' main sessions alone: 6.4 + 0.227*13 + 1.6e-5*1.22M ~ 29 ms > 18.48
+    cs = [Cand("chat", 20_000)] + [
+        Cand(f"m{i}", 100_000, interactive=False, task=f"t{i}", role="main")
+        for i in range(12)
+    ]
+    d = p.decide(cs)
+    assert d.n_demoted > 0 and d.skip and "chat" not in d.skip
+    assert d.pred_kept_ms <= cfg().tau_interactive_ms
+
+
+def test_prefill_in_the_step_reduces_opportunistic_decodes():
+    without = TaperPolicy(cfg()).decide(cands()).n_opp
+    p = TaperPolicy(cfg(prefill_coeffs=(1.0, 0.0005)))
+    assert p.decide(cands(), prefill_tokens=8192).n_opp < without

@@ -11,10 +11,13 @@ lever is which *running* requests decode in each step.
 Policy, once per ``schedule()`` call, over running requests in the decode phase:
 
   interactive   never skipped (no agent context, or an interactive session prefix)
-  protected     never skipped; one task's critical path (``role_aware`` only):
-                the main session's request, or the join stragglers when a task's
-                subagents drain to <= max(1, ceil(w / 4)) of a fan-out of width w,
-                or with no roles the request with the most decoded tokens
+  protected     skipped only to keep interactive on target; one task's critical
+                path (``role_aware`` only): the main session's request, or during
+                a fan-out the subagent with the most context plus the join
+                stragglers once the subagents drain to <= max(1, ceil(w / 4)) of
+                a fan-out of width w, or with no roles the request with the most
+                decoded tokens. If interactive + protected + forced alone break
+                the target, protected requests are demoted, most context first
   forced        skipped K - 1 steps in a row; decodes this step (progress bound)
   opportunistic the rest; first-fit while the predicted step time stays inside
                 T0 + rho * (tau - T0), most-skipped first, then join stragglers,
@@ -23,6 +26,8 @@ Policy, once per ``schedule()`` call, over running requests in the decode phase:
 ``class_blind`` is the HyGen/BROS-style ablation: interactive always runs, every
 agent request is opportunistic. Nothing is skipped when the whole batch already
 fits the tightest per-token target present (the policy is free outside overload).
+The prefill chunk expected in the same step (``DYN_TAPER_PREFILL_COEFFS``) is
+added to every prediction.
 
 Mechanism (vLLM v0.31.0): a skipped request keeps its KV and its place in
 ``self.running``; the skip sets ``request.next_decode_eligible_step`` to
@@ -38,6 +43,8 @@ Dynamo's ``InstrumentedScheduler``.
 Environment:
   DYN_TAPER_ENGINE            off | class_blind | role_aware (default off)
   DYN_TAPER_COEFFS            a,b,c of T(n, L) = a + b*n + c*L ms (fit_step_model.py)
+  DYN_TAPER_PREFILL_COEFFS    q,p: a step with P > 0 prefill tokens adds q + p*P ms
+                              (default 0,0: prefill ignored)
   DYN_TAPER_TAU_INTERACTIVE_MS / DYN_TAPER_TAU_AGENT_MS   per-token targets
   DYN_TAPER_RHO               share of the slack opportunistic decodes may use
   DYN_TAPER_K                 a request decodes at least once every K steps
@@ -70,6 +77,7 @@ ROLE_SUB = "sub"
 class TaperConfig:
     mode: str = "off"
     coeffs: tuple = (6.4013, 0.227066, 0.000016055)
+    prefill_coeffs: tuple = (0.0, 0.0)
     tau_interactive_ms: float = 18.48
     tau_agent_ms: float = 21.63
     rho: float = 0.8
@@ -98,6 +106,11 @@ class TaperConfig:
             if len(parts) != 3:
                 raise ValueError("DYN_TAPER_COEFFS needs three numbers a,b,c")
             c.coeffs = tuple(parts)
+        if env.get("DYN_TAPER_PREFILL_COEFFS"):
+            parts = [float(x) for x in env["DYN_TAPER_PREFILL_COEFFS"].split(",")]
+            if len(parts) != 2:
+                raise ValueError("DYN_TAPER_PREFILL_COEFFS needs two numbers q,p")
+            c.prefill_coeffs = tuple(parts)
         c.tau_interactive_ms = float(
             env.get("DYN_TAPER_TAU_INTERACTIVE_MS", c.tau_interactive_ms)
         )
@@ -184,6 +197,7 @@ class Decision:
     pred_kept_ms: float = 0.0
     n_forced: int = 0
     n_protected: int = 0
+    n_demoted: int = 0
     n_opp: int = 0
 
 
@@ -209,6 +223,13 @@ class TaperPolicy:
     def predict(self, n: int, ctx: int) -> float:
         a, b, c = self.cfg.coeffs
         return self.bias * max(0.0, a + b * n + c * ctx)
+
+    def predict_prefill(self, tokens: int) -> float:
+        """Extra step time for a prefill chunk of ``tokens`` scheduled with the decodes."""
+        if tokens <= 0:
+            return 0.0
+        q, p = self.cfg.prefill_coeffs
+        return self.bias * max(0.0, q + p * tokens)
 
     def observe(
         self, predicted_ms: float, actual_ms: float, alpha: float = 0.05
@@ -244,13 +265,15 @@ class TaperPolicy:
             if mains:
                 out.update(c.req_id for c in mains)
             elif subs:
+                # critical-path proxy for the join: the subagent with most context
+                out.add(max(subs, key=lambda c: (c.ctx, c.req_id)).req_id)
                 if len(subs) <= _ceil_quarter(self._peak_subs.get(task, len(subs))):
                     out.update(c.req_id for c in subs)
             else:  # no roles: attained-service proxy for the critical path
                 out.add(max(cs, key=lambda c: (c.decoded, c.req_id)).req_id)
         return out
 
-    def decide(self, cands: Iterable[Cand]) -> Decision:
+    def decide(self, cands: Iterable[Cand], prefill_tokens: int = 0) -> Decision:
         cands = list(cands)
         live = {c.req_id for c in cands}
         self._skip_run = {r: v for r, v in self._skip_run.items() if r in live}
@@ -270,7 +293,8 @@ class TaperPolicy:
             if len(managed) < len(cands)
             else self.cfg.tau_agent_ms
         )
-        d.pred_all_ms = self.predict(len(cands), sum(c.ctx for c in cands))
+        extra = self.predict_prefill(prefill_tokens)
+        d.pred_all_ms = self.predict(len(cands), sum(c.ctx for c in cands)) + extra
         if d.pred_all_ms <= d.tau_ms or not managed:
             d.pred_kept_ms = d.pred_all_ms
             return self._commit(d, cands)
@@ -280,17 +304,25 @@ class TaperPolicy:
         base_ids = {
             c.req_id for c in cands if c.interactive or c.task is None
         } | protected
-        forced = {
-            c.req_id
-            for c in managed
-            if c.req_id not in base_ids and c.skip_run >= self.cfg.k - 1
-        }
+        forced = {c.req_id for c in managed if c.skip_run >= self.cfg.k - 1}
         base_ids |= forced
-        d.n_forced, d.n_protected = len(forced), len(protected)
-
         n = len(base_ids)
         ctx = sum(c.ctx for c in cands if c.req_id in base_ids)
-        t0 = self.predict(n, ctx)
+        # interactive precedence: demote protected requests, most context first
+        demotable = sorted(
+            (c for c in managed if c.req_id in protected and c.req_id not in forced),
+            key=lambda c: (-c.ctx, c.req_id),
+        )
+        for c in demotable:
+            if self.predict(n, ctx) + extra <= d.tau_ms:
+                break
+            protected.discard(c.req_id)
+            base_ids.discard(c.req_id)
+            n, ctx = n - 1, ctx - c.ctx
+            d.n_demoted += 1
+        d.n_forced, d.n_protected = len(forced), len(protected)
+
+        t0 = self.predict(n, ctx) + extra
         limit = t0 + self.cfg.rho * max(0.0, d.tau_ms - t0)
         opp_ctx = 0
         straggler_tasks = {
@@ -309,12 +341,12 @@ class TaperPolicy:
             guard_ok = (
                 not self.cfg.max_opp_ctx or opp_ctx + c.ctx <= self.cfg.max_opp_ctx
             )
-            if guard_ok and self.predict(n + 1, ctx + c.ctx) <= limit:
+            if guard_ok and self.predict(n + 1, ctx + c.ctx) + extra <= limit:
                 n, ctx, opp_ctx = n + 1, ctx + c.ctx, opp_ctx + c.ctx
                 d.n_opp += 1
             else:
                 d.skip.add(c.req_id)
-        d.pred_kept_ms = self.predict(n, ctx)
+        d.pred_kept_ms = self.predict(n, ctx) + extra
         return self._commit(d, cands)
 
     def _commit(self, d: Decision, cands: list) -> Decision:
@@ -406,7 +438,7 @@ class TaperSkipMixin:
             if c is not None:
                 cands.append(c)
                 by_id[c.req_id] = req
-        d = self._taper.decide(cands)
+        d = self._taper.decide(cands, self._taper_prefill_estimate())
         if d.skip:
             # schedule() increments current_step first, so this skips exactly one step.
             nxt = self.current_step + 2
@@ -414,6 +446,24 @@ class TaperSkipMixin:
                 req = by_id[rid]
                 req.next_decode_eligible_step = max(req.next_decode_eligible_step, nxt)
         return d
+
+    def _taper_prefill_estimate(self) -> int:
+        """Prefill tokens the coming step will likely carry: running prefill chunks,
+        then waiting prompts, capped at the step's token budget."""
+        if not any(self._taper_cfg.prefill_coeffs):
+            return 0
+        budget = getattr(self, "max_num_scheduled_tokens", 0) or 8192
+        tokens = 0
+        for req in self.running:
+            if req.num_computed_tokens < req.num_prompt_tokens:
+                tokens += req.num_prompt_tokens - req.num_computed_tokens
+                if tokens >= budget:
+                    return budget
+        for req in self.waiting:
+            tokens += req.num_prompt_tokens - req.num_computed_tokens
+            if tokens >= budget:
+                return budget
+        return tokens
 
     def _taper_after_schedule(self, output: Any, d: Optional[Decision]) -> None:
         if d is None or output.total_num_scheduled_tokens <= 0:
