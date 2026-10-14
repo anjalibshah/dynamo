@@ -42,6 +42,16 @@ taper_engine.py), loaded by file path, run at each --rhos value:
                what task structure adds; both vs class_blind what size
                knowledge adds
 
+Realistic proxies for remaining work (class_blind plus a fill order, no
+protection), to see how much of oracle_blind's gain an engine could capture:
+
+  las          least attained service of the request's session first (decode
+               tokens served so far across the session's requests; Autellix-style)
+  las_task     least attained service of the request's task first (Autellix PLAS)
+  ctx          smallest context first
+  noisyX       oracle_blind's remaining work times exp(N(0, X)), drawn once per
+               request (a learned predictor with log-error sigma X), e.g. noisy0.5
+
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
 compares the stock simulation with the recording in its own T80 window; do not
@@ -258,14 +268,30 @@ def oracle_policy(eng, cfg, task_aware: bool):
     return OraclePolicy(cfg)
 
 
+def score_policy(eng, cfg):
+    class ScorePolicy(eng.TaperPolicy):
+        """class_blind with opportunistic requests offered the slack lowest score first."""
+
+        score: dict = {}
+
+        def _fill_key(self, c, straggler_tasks) -> tuple:
+            return (self.score[c.req_id], c.req_id)
+
+    cfg.mode = "class_blind"
+    return ScorePolicy(cfg)
+
+
 def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, seed: int,
              closed: bool = True) -> dict:
     rng = random.Random(seed)
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
     pol = None
+    proxy = policy in ("las", "las_task", "ctx") or policy.startswith("noisy")
     if policy in ("oracle", "oracle_blind"):
         pol = oracle_policy(eng, cfg, policy == "oracle")
+    elif proxy:
+        pol = score_policy(eng, cfg)
     elif policy != "stock":
         cfg.mode = policy
         pol = eng.TaperPolicy(cfg)
@@ -280,6 +306,13 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
     latest_dep = defaultdict(float)
     arrive, first, done = {}, {}, {}
     left = {r.i: r.need for r in reqs}
+    att_session: dict = defaultdict(int)  # decode tokens served, per session / task
+    att_task: dict = defaultdict(int)
+    err = {}
+    if policy.startswith("noisy"):
+        sigma = float(policy[len("noisy"):])
+        erng = random.Random(seed + 1)
+        err = {r.i: math.exp(erng.gauss(0.0, sigma)) for r in reqs}
     ctx = {r.i: r.inp + 1 for r in reqs}
     skip_run = defaultdict(int)
     prefill_q: deque = deque()  # [index, remaining new tokens]
@@ -308,6 +341,15 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
             cands = [eng.Cand(req_id=r.i, ctx=ctx[r.i], interactive=r.interactive,
                               task=r.task, role=r.role, decoded=r.need - left[r.i] + 1)
                      for r in active.values()]
+            if proxy:
+                if policy == "las":
+                    pol.score = {i: att_session[reqs[i].session] for i in active}
+                elif policy == "las_task":
+                    pol.score = {i: att_task[reqs[i].task] for i in active}
+                elif policy == "ctx":
+                    pol.score = {i: ctx[i] for i in active}
+                else:
+                    pol.score = {i: (left[i] + reqs[i].future) * err[i] for i in active}
             if pol.__class__.__name__ == "OraclePolicy":
                 pol.remaining = {i: left[i] + reqs[i].future for i in active}
                 pol.task_rem = defaultdict(int)
@@ -343,6 +385,9 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
             skip_run[i] = 0
             left[i] -= 1
             ctx[i] += 1
+            if not r.interactive:
+                att_session[r.session] += 1
+                att_task[r.task] += 1
             if left[i] == 0:
                 del active[i]
                 finish(i)
@@ -432,11 +477,14 @@ def score(reqs, sim, stock, factor, anchor, ttft_ms) -> dict:
     return s
 
 
-def matched(rows: dict, levels: list[float]) -> list[str]:
-    """Per interactive level: each policy's best task p90 among rhos reaching it."""
+def matched(rows: dict, levels: list[float], summary: dict | None = None) -> list[str]:
+    """Per interactive level: each policy's best task p90 among rhos reaching it.
+
+    Also the share of oracle_blind's gain over class_blind each policy captures;
+    ratios and shares are added to ``summary[(level, policy)]`` for the
+    cross-run summary."""
     out = []
-    pols = sorted({p for p, _ in rows if p != "stock"},
-                  key=lambda p: ("class_blind", "role_aware", "oracle", "oracle_blind").index(p))
+    pols = list(dict.fromkeys(p for p, _ in rows if p != "stock"))
     for lv in levels:
         best = {}
         for pol in pols:
@@ -455,6 +503,22 @@ def matched(rows: dict, levels: list[float]) -> list[str]:
                   if pol != "class_blind" and cb and best[pol]]
         out.append(f"inter >= {lv:.0%}: task p90 " + ", ".join(parts)
                    + ("  " + " ".join(ratios) if ratios else ""))
+        ob = best.get("oracle_blind")
+        shares = {}
+        if cb and ob and cb[0] > ob[0]:
+            for pol in pols:
+                if pol not in ("class_blind", "oracle_blind") and best[pol]:
+                    shares[pol] = (cb[0] - best[pol][0]) / (cb[0] - ob[0])
+            if shares:
+                out.append("    share of oracle_blind's gain: "
+                           + " ".join(f"{p} {v:.0%}" for p, v in shares.items()))
+        if summary is not None and cb:
+            for pol in pols:
+                if pol != "class_blind" and best[pol]:
+                    summary.setdefault((lv, pol), {"ratio": [], "share": []})
+                    summary[(lv, pol)]["ratio"].append(best[pol][0] / cb[0])
+                    if pol in shares:
+                        summary[(lv, pol)]["share"].append(shares[pol])
     return out
 
 
@@ -472,7 +536,8 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=0,
                     help="step token budget; default: from fpm.jsonl, else 8192")
     ap.add_argument("--rhos", default="0.6,0.8,1.0")
-    ap.add_argument("--policies", default="class_blind,role_aware,oracle,oracle_blind")
+    ap.add_argument("--policies",
+                    default="class_blind,oracle_blind,las,las_task,ctx,noisy0.5,noisy1")
     ap.add_argument("--levels", default="0.5,0.8,0.9,0.95")
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--max-opp-ctx", type=int, default=0)
@@ -507,6 +572,7 @@ def main() -> None:
            f"{'main sl p50/p90':>15} {'sub sl p50/p90':>14} {'task p90':>8} {'t80':>5} "
            f"{'engaged':>7} {'skipped':>7} {'dem/st':>6} {'maxrun':>6} {'busy':>5}")
     out = {}
+    summary: dict = {}
     for run in runs:
         path = os.path.join(a.root, run, "trace.jsonl")
         if not os.path.exists(path):
@@ -555,11 +621,21 @@ def main() -> None:
                   f"{s['sub50']:>6.2f}/{s['sub90']:<7.2f} {s['task90']:>8.2f} {s['t80']:>5.2f} "
                   f"{s['engaged']:>7.1%} {s['skipped']:>7.1%} {s['demoted']:>6.2f} "
                   f"{s['max_skip']:>6} {s['busy']:>5.2f}")
-        for line in matched(rows, levels):
+        for line in matched(rows, levels, summary):
             print("   " + line)
         print()
         out[run] = {"fidelity": {"recorded": meas, "stock_sim": st},
                     "rows": {f"{p}@{r:g}": s for (p, r), s in rows.items()}}
+    if summary:
+        print("== summary over runs: task p90 / class_blind (mean, range); "
+              "share of oracle_blind's gain (mean, range)")
+        for (lv, pol), v in sorted(summary.items()):
+            r, sh = v["ratio"], v["share"]
+            line = (f"   inter >= {lv:.0%} {pol:<13} ratio {sum(r) / len(r):.2f} "
+                    f"[{min(r):.2f}-{max(r):.2f}] over {len(r)} runs")
+            if sh:
+                line += f", share {sum(sh) / len(sh):.0%} [{min(sh):.0%}-{max(sh):.0%}]"
+            print(line)
     if a.json:
         with open(a.json, "w") as f:
             json.dump(out, f, indent=1)
