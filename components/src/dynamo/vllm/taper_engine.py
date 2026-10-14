@@ -273,6 +273,10 @@ class TaperPolicy:
                 out.add(max(cs, key=lambda c: (c.decoded, c.req_id)).req_id)
         return out
 
+    def _demote_key(self, c: Cand) -> tuple:
+        """Order in which protected requests lose protection: most context first."""
+        return (-c.ctx, c.req_id)
+
     def decide(self, cands: Iterable[Cand], prefill_tokens: int = 0) -> Decision:
         cands = list(cands)
         live = {c.req_id for c in cands}
@@ -311,7 +315,7 @@ class TaperPolicy:
         # interactive precedence: demote protected requests, most context first
         demotable = sorted(
             (c for c in managed if c.req_id in protected and c.req_id not in forced),
-            key=lambda c: (-c.ctx, c.req_id),
+            key=self._demote_key,
         )
         for c in demotable:
             if self.predict(n, ctx) + extra <= d.tau_ms:

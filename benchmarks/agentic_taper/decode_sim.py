@@ -30,6 +30,11 @@ taper_engine.py), loaded by file path, run at each --rhos value:
   stock        every active request decodes every step (vLLM eager)
   class_blind  HyGen/BROS-style: interactive always, agents by fit
   role_aware   ours: plus the task critical path protected
+  oracle       role_aware with perfect knowledge (simulation only): per task,
+               protect the request whose session has the most decode work left
+               (this request's remaining tokens + the session's later
+               requests), and demote the least such work first. An upper bound
+               on what task-aware selection can add over class_blind here
 
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
@@ -79,13 +84,15 @@ def _q(v: list, q: float) -> float:
 
 
 class Req:
-    __slots__ = ("i", "arr", "end", "ttft", "need", "inp", "new", "interactive", "task",
+    __slots__ = ("i", "arr", "end", "ttft", "need", "inp", "new", "future", "interactive",
+                 "task",
                  "role", "session", "deps", "gap")
 
     def __init__(self, i, arr, end, ttft, need, inp, interactive, task, role, session):
         self.i, self.arr, self.end, self.ttft, self.need, self.inp = i, arr, end, ttft, need, inp
         self.interactive, self.task, self.role, self.session = interactive, task, role, session
         self.new = inp
+        self.future = 0  # decode tokens of the session's later requests
         self.deps, self.gap = [], 0.0
 
 
@@ -118,6 +125,16 @@ def load_trace(path: str, interactive_prefix: str) -> list[Req]:
     for r in reqs:
         r.arr, r.end = r.arr - t0, r.end - t0
     new_prompt_tokens(reqs, cached)
+    by_session = defaultdict(list)
+    for r in reqs:
+        if not r.interactive:
+            by_session[r.session].append(r)
+    for rs in by_session.values():
+        rs.sort(key=lambda r: r.arr)
+        acc = 0
+        for r in reversed(rs):
+            r.future = acc
+            acc += r.need
     infer_deps(reqs)
     return reqs
 
@@ -214,13 +231,32 @@ def fit_prefill(path: str, coeffs: tuple, max_ms: float = 1000.0) -> dict | None
 # ---------------------------------------------------------------------------
 
 
+def oracle_policy(eng, cfg):
+    class OraclePolicy(eng.TaperPolicy):
+        """Protects, per task, the request with the most session work left."""
+
+        remaining: dict = {}
+
+        def _protected(self, by_task: dict) -> set:
+            return {max(cs, key=lambda c: (self.remaining[c.req_id], c.req_id)).req_id
+                    for cs in by_task.values()}
+
+        def _demote_key(self, c) -> tuple:
+            return (self.remaining[c.req_id], c.req_id)
+
+    cfg.mode = "role_aware"
+    return OraclePolicy(cfg)
+
+
 def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, seed: int,
              closed: bool = True) -> dict:
     rng = random.Random(seed)
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
     pol = None
-    if policy != "stock":
+    if policy == "oracle":
+        pol = oracle_policy(eng, cfg)
+    elif policy != "stock":
         cfg.mode = policy
         pol = eng.TaperPolicy(cfg)
     waiting = {r.i: len(r.deps) for r in reqs} if closed else {}
@@ -262,6 +298,8 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
             cands = [eng.Cand(req_id=r.i, ctx=ctx[r.i], interactive=r.interactive,
                               task=r.task, role=r.role, decoded=r.need - left[r.i] + 1)
                      for r in active.values()]
+            if policy == "oracle":
+                pol.remaining = {i: left[i] + reqs[i].future for i in active}
             d = pol.decide(cands, min(pending_prefill, budget))
             skip = d.skip
             engaged += d.engaged
@@ -383,21 +421,26 @@ def score(reqs, sim, stock, factor, anchor, ttft_ms) -> dict:
 def matched(rows: dict, levels: list[float]) -> list[str]:
     """Per interactive level: each policy's best task p90 among rhos reaching it."""
     out = []
+    pols = sorted({p for p, _ in rows if p != "stock"},
+                  key=lambda p: ("class_blind", "role_aware", "oracle").index(p))
     for lv in levels:
         best = {}
-        for pol in ("class_blind", "role_aware"):
+        for pol in pols:
             ok = [(s["task90"], rho) for (p, rho), s in rows.items()
                   if p == pol and s["on"] >= lv]
             best[pol] = min(ok) if ok else None
-        cb, ra = best["class_blind"], best["role_aware"]
         top = {pol: max((s["on"] for (p, _), s in rows.items() if p == pol), default=0.0)
-               for pol in best}
-
-        def fmt(x, pol, top=top):
-            return f"{x[0]:.2f} (rho {x[1]:g})" if x else f"unreached (max {top[pol]:.1%})"
-        verdict = (f"RA/CB {ra[0] / cb[0]:.2f}" if cb and ra else "-")
-        out.append(f"inter >= {lv:.0%}: class_blind task p90 {fmt(cb, 'class_blind')}, "
-                   f"role_aware {fmt(ra, 'role_aware')}  {verdict}")
+               for pol in pols}
+        parts = []
+        for pol in pols:
+            x = best[pol]
+            parts.append(f"{pol} {x[0]:.2f} (rho {x[1]:g})" if x
+                         else f"{pol} unreached (max {top[pol]:.1%})")
+        cb = best.get("class_blind")
+        ratios = [f"{pol}/CB {best[pol][0] / cb[0]:.2f}" for pol in pols
+                  if pol != "class_blind" and cb and best[pol]]
+        out.append(f"inter >= {lv:.0%}: task p90 " + ", ".join(parts)
+                   + ("  " + " ".join(ratios) if ratios else ""))
     return out
 
 
@@ -415,7 +458,7 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=0,
                     help="step token budget; default: from fpm.jsonl, else 8192")
     ap.add_argument("--rhos", default="0.6,0.8,1.0")
-    ap.add_argument("--policies", default="class_blind,role_aware")
+    ap.add_argument("--policies", default="class_blind,role_aware,oracle")
     ap.add_argument("--levels", default="0.5,0.8,0.9,0.95")
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--max-opp-ctx", type=int, default=0)
