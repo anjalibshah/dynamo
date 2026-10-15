@@ -10,7 +10,10 @@ lever is which *running* requests decode in each step.
 
 Policy, once per ``schedule()`` call, over running requests in the decode phase:
 
-  interactive   never skipped (no agent context, or an interactive session prefix)
+  interactive   never skipped. With DYN_TAPER_PRIORITY_MIN set: Dynamo request
+                priority (nvext.agent_hints.priority) >= that value, and every
+                lower-priority request is regulated. Unset (the benchmark rule):
+                no agent context, or an interactive session prefix
   protected     skipped only to keep interactive on target; one task's critical
                 path (``role_aware`` only): the main session's request, or during
                 a fan-out the subagent with the most context plus the join
@@ -49,7 +52,13 @@ Environment:
   DYN_TAPER_RHO               share of the slack opportunistic decodes may use
   DYN_TAPER_K                 a request decodes at least once every K steps
   DYN_TAPER_MAX_OPP_CTX       coarse guard: opportunistic context per step (0 = off)
+  DYN_TAPER_PRIORITY_MIN      requests with Dynamo priority >= this get the
+                              interactive target; the rest are regulated (unset:
+                              classify by agent context, as below)
   DYN_TAPER_INTERACTIVE_PREFIX  session-id prefix marking interactive sessions
+  DYN_TAPER_FAILSAFE_STEPS    fail open (stock vLLM scheduling) after this many
+                              consecutive decode-only steps with the step-time
+                              bias pinned at its 0.5 / 2.0 clamp (0 = never)
   DYN_TAPER_TRACE             JSONL path for per-step records (offline replay)
   DYN_TAPER_LOG_S             seconds between summary log lines
 """
@@ -84,6 +93,8 @@ class TaperConfig:
     k: int = 4
     max_opp_ctx: int = 0
     interactive_prefix: str = "victim-"
+    priority_min: Optional[int] = None
+    failsafe_steps: int = 200
     trace_path: str = ""
     log_s: float = 10.0
 
@@ -123,6 +134,9 @@ class TaperConfig:
         c.interactive_prefix = env.get(
             "DYN_TAPER_INTERACTIVE_PREFIX", c.interactive_prefix
         )
+        if env.get("DYN_TAPER_PRIORITY_MIN", "").strip():
+            c.priority_min = int(env["DYN_TAPER_PRIORITY_MIN"])
+        c.failsafe_steps = int(env.get("DYN_TAPER_FAILSAFE_STEPS", c.failsafe_steps))
         c.trace_path = env.get("DYN_TAPER_TRACE", "")
         c.log_s = float(env.get("DYN_TAPER_LOG_S", c.log_s))
         return c
@@ -133,18 +147,46 @@ class TaperConfig:
 # ---------------------------------------------------------------------------
 
 
-def identity_from_request(request: Mapping[str, Any], interactive_prefix: str) -> dict:
-    """{"task", "role", "interactive"} for the engine, from the request's agent context.
+def request_priority(request: Mapping[str, Any]) -> int:
+    """Dynamo semantic priority (higher is more important; unset is 0)."""
+    routing = request.get("routing")
+    p = routing.get("priority") if isinstance(routing, Mapping) else None
+    try:
+        return int(p) if p is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
-    The task is the root session: ``parent_session_id`` when present, else the
-    session itself (the same rule as the taper router). A request without agent
-    context is interactive (plain chat traffic is never regulated)."""
+
+def identity_from_request(
+    request: Mapping[str, Any],
+    interactive_prefix: str,
+    priority_min: Optional[int] = None,
+) -> dict:
+    """{"task", "role", "interactive"} for the engine.
+
+    With ``priority_min``, a request is interactive iff its Dynamo priority is
+    at least ``priority_min``; any other request is regulated, with its task and
+    role from the agent context when it has one. Without it (the benchmark
+    rule), a request without agent context, or with a session id starting with
+    ``interactive_prefix``, is interactive. The task is the root session:
+    ``parent_session_id`` when present, else the session itself (the same rule
+    as the taper router)."""
     ctx = request.get("agent_context")
     sid = ctx.get("session_id") if isinstance(ctx, Mapping) else None
-    if not isinstance(sid, str) or not sid.strip():
+    has_sid = isinstance(sid, str) and bool(sid.strip())
+    if priority_min is not None:
+        if request_priority(request) >= priority_min:
+            return {"interactive": True}
+        if not has_sid:
+            return {"interactive": False}
+    elif not has_sid:
         return {"interactive": True}
     sid = sid.strip()
-    if interactive_prefix and sid.startswith(interactive_prefix):
+    if (
+        priority_min is None
+        and interactive_prefix
+        and sid.startswith(interactive_prefix)
+    ):
         return {"interactive": True}
     parent = ctx.get("parent_session_id")
     task = parent if isinstance(parent, str) and parent else sid
@@ -166,7 +208,9 @@ def attach_identity(
         return
     extra = sampling_params.extra_args
     extra = dict(extra) if isinstance(extra, dict) else {}
-    extra[EXTRA_ARGS_KEY] = identity_from_request(request, cfg.interactive_prefix)
+    extra[EXTRA_ARGS_KEY] = identity_from_request(
+        request, cfg.interactive_prefix, cfg.priority_min
+    )
     sampling_params.extra_args = extra
 
 
@@ -199,6 +243,7 @@ class Decision:
     n_protected: int = 0
     n_demoted: int = 0
     n_opp: int = 0
+    n_managed: int = 0  # regulated (non-interactive) decode-phase requests
 
 
 def _ceil_quarter(w: int) -> int:
@@ -308,6 +353,7 @@ class TaperPolicy:
             return self._commit(d, cands)
 
         d.engaged = True
+        d.n_managed = len(managed)
         protected = self._protected(by_task) if self.cfg.mode == "role_aware" else set()
         base_ids = {
             c.req_id for c in cands if c.interactive or c.task is None
@@ -381,14 +427,11 @@ def cand_from_request(req: Any) -> Optional[Cand]:
         ctx=req.num_computed_tokens,
         decoded=req.num_output_tokens,
     )
-    if (
-        isinstance(ident, dict)
-        and not ident.get("interactive", True)
-        and ident.get("task")
-    ):
+    if isinstance(ident, dict) and not ident.get("interactive", True):
+        # a regulated request without agent context is a task of its own
         c.interactive, c.task, c.role = (
             False,
-            str(ident["task"]),
+            str(ident.get("task") or req.request_id),
             str(ident.get("role", "")),
         )
     return c
@@ -418,6 +461,7 @@ class TaperSkipMixin:
             else None
         )
         self._taper_stats = _Stats()
+        self._taper_pinned = 0  # consecutive decode-only steps with bias at a clamp
         self._taper_next_log = time.monotonic() + self._taper_cfg.log_s
         if self._taper_cfg.enabled:
             logger.info(
@@ -501,6 +545,7 @@ class TaperSkipMixin:
         if decode_only and n:
             self._taper.observe(pred, actual)
             self._taper_stats.on_step(pred, actual)
+            self._taper_failsafe()
         if self._taper_trace is not None:
             self._taper_trace.write(
                 json.dumps(
@@ -530,6 +575,28 @@ class TaperSkipMixin:
             logger.info(
                 "taper.engine %s", self._taper_stats.summary_and_reset(self._taper.bias)
             )
+
+    def _taper_failsafe(self) -> None:
+        """Fail open when the step-time model is persistently wrong.
+
+        The bias corrects a model that is off by up to 2x either way; pinned at
+        the clamp, predictions (and so skips) can no longer be trusted, e.g.
+        coefficients fitted for another GPU or model. Skips stop and the
+        scheduler behaves as stock vLLM until restart."""
+        limit = self._taper_cfg.failsafe_steps
+        if limit <= 0:
+            return
+        b = self._taper.bias
+        self._taper_pinned = self._taper_pinned + 1 if b <= 0.5 or b >= 2.0 else 0
+        if self._taper_pinned >= limit:
+            logger.warning(
+                "taper.engine disabled: step-time bias pinned at %.2f for %d steps; "
+                "refit DYN_TAPER_COEFFS for this GPU and model (fit_step_model.py)",
+                b,
+                self._taper_pinned,
+            )
+            self._taper_cfg.mode = "off"
+            self._taper_stats.disabled = True
 
     def _taper_close(self) -> None:
         if self._taper_trace is not None:
@@ -563,12 +630,16 @@ class _Stats:
 
     def reset(self) -> None:
         self.steps = self.engaged = self.skipped = self.forced = 0
+        self.regulated = 0  # regulated request-steps seen while engaged
         self.max_skip_run = 0
         self.err = []
+        self.disabled = getattr(self, "disabled", False)
 
     def on_decision(self, d: Decision, policy: TaperPolicy) -> None:
         self.steps += 1
         self.engaged += d.engaged
+        if d.engaged:
+            self.regulated += d.n_managed
         self.skipped += len(d.skip)
         self.forced += d.n_forced
         for rid in d.skip:
@@ -580,10 +651,12 @@ class _Stats:
     def summary_and_reset(self, bias: float) -> str:
         e = sorted(self.err)
         mape = f"{e[len(e) // 2]:.1%}" if e else "-"
+        share = f"{self.skipped / self.regulated:.1%}" if self.regulated else "-"
         s = (
             f"steps={self.steps} engaged={self.engaged} skipped={self.skipped} "
-            f"forced={self.forced} max_skip_run={self.max_skip_run} "
-            f"pred_err_p50={mape} bias={bias:.3f}"
+            f"skip_share={share} forced={self.forced} "
+            f"max_skip_run={self.max_skip_run} pred_err_p50={mape} bias={bias:.3f}"
+            + (" DISABLED" if self.disabled else "")
         )
         self.reset()
         return s

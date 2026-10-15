@@ -260,6 +260,73 @@ def test_identity_from_request(ctx, expected):
     assert identity_from_request(req, "victim-") == expected
 
 
+@pytest.mark.parametrize(
+    ("req", "expected"),
+    [
+        ({"routing": {"priority": 5}}, {"interactive": True}),
+        ({"routing": {"priority": 1}}, {"interactive": True}),
+        ({}, {"interactive": False}),  # unset priority is 0
+        ({"routing": {"priority": "x"}}, {"interactive": False}),
+        (
+            {"routing": {"priority": 5}, "agent_context": {"session_id": "root"}},
+            {"interactive": True},
+        ),
+        (
+            {"agent_context": {"session_id": "c", "parent_session_id": "root"}},
+            {"task": "root", "role": "sub", "interactive": False},
+        ),
+        # the benchmark prefix rule does not apply in priority mode
+        (
+            {"agent_context": {"session_id": "victim-3"}},
+            {"task": "victim-3", "role": "main", "interactive": False},
+        ),
+    ],
+)
+def test_identity_from_priority(req, expected):
+    assert identity_from_request(req, "victim-", priority_min=1) == expected
+
+
+def test_priority_mode_regulates_plain_low_priority_requests():
+    lo = {EXTRA_ARGS_KEY: {"interactive": False}}
+    reqs = [FakeRequest("chat", 20_000)]
+    reqs += [FakeRequest(f"b{i}", 100_000) for i in range(10)]
+    for r in reqs[1:]:
+        r.sampling_params.extra_args = dict(lo)
+    s = Sched(reqs, cfg("class_blind", priority_min=1))
+    scheduled = step(s)
+    assert "chat" in scheduled
+    assert len(scheduled) < len(reqs)  # each plain request is its own task
+
+
+def test_failsafe_disables_when_bias_stays_pinned():
+    s = Sched(overloaded(), cfg(failsafe_steps=3))
+    s._taper.bias = 2.0
+    for _ in range(2):
+        s._taper_failsafe()
+    assert s._taper_cfg.enabled
+    s._taper_failsafe()
+    assert not s._taper_cfg.enabled
+    assert step(s) == {r.request_id for r in s.running}  # stock scheduling
+
+
+def test_failsafe_resets_when_bias_recovers():
+    s = Sched(overloaded(), cfg(failsafe_steps=3))
+    for b in (2.0, 2.0, 1.2, 2.0, 2.0):
+        s._taper.bias = b
+        s._taper_failsafe()
+    assert s._taper_cfg.enabled
+
+
+def test_config_priority_from_env():
+    c = TaperConfig.from_env(
+        {"DYN_TAPER_ENGINE": "class_blind", "DYN_TAPER_PRIORITY_MIN": "1"}
+    )
+    assert c.priority_min == 1
+    assert (
+        TaperConfig.from_env({"DYN_TAPER_ENGINE": "class_blind"}).priority_min is None
+    )
+
+
 def test_attach_identity_keeps_other_extra_args():
     sp = SimpleNamespace(extra_args={"kv_transfer_params": {"x": 1}})
     attach_identity(sp, {"agent_context": {"session_id": "root"}}, cfg())
