@@ -91,6 +91,8 @@ OUT="$REPO/$OUT_REL"
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
 SITE_VLLM=/usr/local/lib/python3.12/dist-packages/dynamo/vllm
 PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
+"$PY" -c 'import aiohttp' 2>/dev/null || {
+    echo "PY=$PY cannot import aiohttp (the interactive client needs it); set PY" >&2; exit 2; }
 # vLLM TP>1 workers share state via /dev/shm; podman's 64 MB default is too
 # small (MiniMax-M2 TP4 needs >160 MB). Harmless for TP1.
 SHM_SIZE="${SHM_SIZE:-32g}"
