@@ -28,6 +28,10 @@
 #   cb      class-blind per-step decode regulation (TaperScheduler,
 #           DYN_TAPER_ENGINE=class_blind) classifying by priority: requests with
 #           priority >= PRIORITY_MIN get the ITL target (needs VICTIM_PRIORITY)
+#   cbt<m>  cb with the interactive per-token target ENGINE_TAU_MS x m
+#           (cbt1.5, cbt2: a looser target, so fewer agent decodes skipped)
+#   cbk<K>  cb with DYN_TAPER_K=K: every request decodes at least once every
+#           K steps (cbk2: at most one skipped step in a row; default K is 4)
 # VICTIM_PRIORITY stamps nvext.agent_hints.priority on every interactive
 # request (set it for every arm of a comparison so request bodies match).
 # MOUNT_VLLM=1 mounts this checkout's components/src/dynamo/vllm over the
@@ -69,6 +73,9 @@ MOUNT_VLLM="${MOUNT_VLLM:-0}"
 # MiniMax-M2 TP4 H200): "a,b,c" decode and "q,p" prefill, in ms (p per token).
 ENGINE_COEFFS="${ENGINE_COEFFS:-}"
 ENGINE_PREFILL_COEFFS="${ENGINE_PREFILL_COEFFS:-17.5,0.035}"
+# Interactive per-token target of the cb arms in ms (TaperConfig default); the
+# cbt<m> arms multiply it.
+ENGINE_TAU_MS="${ENGINE_TAU_MS:-18.48}"
 AGENT="${AGENT:-claude-code}"
 OC_VERSION="${OC_VERSION:-1.19.0}"     # 1.19.0 sends each subagent's own x-session-id
 OMO_VERSION="${OMO_VERSION:-5.1.32}"
@@ -149,14 +156,16 @@ echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
     case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow|prio|cb) ;;
+        cbt[0-9]*|cbk[0-9]*) [[ "$arm" =~ ^cb(t[0-9]+(\.[0-9]+)?|k[1-9][0-9]*)$ ]] \
+            || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; } ;;
         *) echo "bad arm in ${SPEC[$s]}" >&2; exit 2 ;; esac
     if [[ ( "$arm" == taper || "$arm" == shadow ) && -z "$PRED_COEFFS" ]]; then
         echo "arm $arm needs PRED_COEFFS=a,b,c" >&2; exit 2
     fi
-    if [[ ( "$arm" == prio || "$arm" == cb ) && -z "$VICTIM_PRIORITY" ]]; then
+    if [[ ( "$arm" == prio || "$arm" == cb* ) && -z "$VICTIM_PRIORITY" ]]; then
         echo "arm $arm needs VICTIM_PRIORITY (e.g. 1)" >&2; exit 2
     fi
-    if [[ "$arm" == cb ]] && (( VICTIM_PRIORITY < PRIORITY_MIN )); then
+    if [[ "$arm" == cb* ]] && (( VICTIM_PRIORITY < PRIORITY_MIN )); then
         echo "arm cb: VICTIM_PRIORITY=$VICTIM_PRIORITY < PRIORITY_MIN=$PRIORITY_MIN would regulate the interactive requests" >&2; exit 2
     fi
     run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 100 * s))
@@ -175,10 +184,14 @@ for s in "${!SPEC[@]}"; do
              extra=(-e DYN_TAPER_MODE=taper -e "DYN_TAPER_PREDICTOR_COEFFS=$PRED_COEFFS")
              [[ "$arm" == shadow ]] && extra+=(-e DYN_TAPER_SHADOW_MODE=true) ;;
         prio) vllm_args="$vllm_args --scheduling-policy priority" ;;
-        cb) extra=(-e DYN_TAPER_ENGINE=class_blind -e "DYN_TAPER_PRIORITY_MIN=$PRIORITY_MIN"
-                   -e "DYN_TAPER_PREFILL_COEFFS=$ENGINE_PREFILL_COEFFS"
-                   -e "DYN_TAPER_TRACE=/workspace/$OUT_REL/$run/taper_engine.jsonl")
-            [[ -n "$ENGINE_COEFFS" ]] && extra+=(-e "DYN_TAPER_COEFFS=$ENGINE_COEFFS") ;;
+        cb*) extra=(-e DYN_TAPER_ENGINE=class_blind -e "DYN_TAPER_PRIORITY_MIN=$PRIORITY_MIN"
+                    -e "DYN_TAPER_PREFILL_COEFFS=$ENGINE_PREFILL_COEFFS"
+                    -e "DYN_TAPER_TRACE=/workspace/$OUT_REL/$run/taper_engine.jsonl")
+             [[ -n "$ENGINE_COEFFS" ]] && extra+=(-e "DYN_TAPER_COEFFS=$ENGINE_COEFFS")
+             case "$arm" in
+                 cbt*) extra+=(-e "DYN_TAPER_TAU_INTERACTIVE_MS=$(python3 -c "print(round($ENGINE_TAU_MS * ${arm#cbt}, 3))")") ;;
+                 cbk*) extra+=(-e "DYN_TAPER_K=${arm#cbk}") ;;
+             esac ;;
     esac
     (( MOUNT_VLLM )) && extra+=(-v "$REPO/components/src/dynamo/vllm:$SITE_VLLM")
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
@@ -256,7 +269,7 @@ for s in "${!SPEC[@]}"; do
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" defers=$(grep -c 'taper.defer' <<<"$log" || true) forced=$(grep -c 'taper.forced_admit' <<<"$log" || true)"
     fi
-    if [[ "$run" == *-cb-* ]]; then
+    if [[ "$run" == *-cb-* || "$run" == *-cbt*-* || "$run" == *-cbk*-* ]]; then
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" engine: $(grep -o 'taper.engine steps=.*' <<<"$log" | tail -1 || true)"
         grep -q 'taper.engine disabled' <<<"$log" && gate+=" [DISABLED: $(grep -m1 -o 'taper.engine disabled.*' <<<"$log")]"

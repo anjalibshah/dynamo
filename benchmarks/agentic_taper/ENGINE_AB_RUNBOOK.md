@@ -135,3 +135,66 @@ Also record the overhead line (`decide_p50/p99`) and the skipped share
   simulated; report the trade-off curve rather than a default-on feature.
 - **R5 fails:** a correctness or calibration problem; fix and re-run the
   smoke test before any conclusion.
+
+## Trade-off experiment (e2)
+
+e1 failed the rule at 24 agents on cost (task p90 x1.59, throughput x0.87,
+both beyond the s1/s2 kv spread) while interactive reached 0.94 against 0.13
+for existing priority. Following "R3 or R4 fails", e2 measures the trade-off
+curve at 24 agents instead of re-running e1. It is a new experiment with its
+own rule, fixed before the runs; e1's verdict stands whatever e2 shows.
+
+### Arms (24 agents, same setup and backend code as e1)
+
+| Arm | Change from `cb` | Expected |
+|---|---|---|
+| `cbt1.5` | interactive per-token target x1.5 (`DYN_TAPER_TAU_INTERACTIVE_MS`) | fewer agent decodes skipped; interactive held to a looser deadline |
+| `cbt2` | target x2 | further along the curve |
+| `cbk2` | `DYN_TAPER_K=2`: every request decodes at least every other step | caps skipping at 50% per request; interactive may drop |
+| `cb`, `kv` | none (replicates of e1) | pooled with e1: two runs each, and a measured cb-vs-cb spread |
+
+`prio` is not re-run; e1's `prio-n24` is the existing-priority reference.
+
+### Rule
+
+Scored by `tradeoff_report.py` over e1 and e2 pooled: each metric is the mean
+over an arm's runs, against the mean of all `kv` runs at 24 agents. An arm is
+an acceptable operating point if:
+
+| | Criterion |
+|---|---|
+| A1 | interactive share meeting the arm's own deadline (500 ms + 3 x m x 4.95 ms per token, m the target multiplier) >= 0.80 |
+| A2 | that share minus `prio`'s at the same deadline >= 0.30 |
+| A3 | task p90 / kv <= 1.40 |
+| A4 | throughput / kv >= 0.90 |
+| A5 | engine health as R5 |
+
+A looser target is only worth offering if the interactive traffic still
+meets it (A1) and existing priority does not already meet it (A2).
+
+### Run (about 3 hours on 8 GPUs, gpu-04)
+
+Engine code must be the same as e1 (`taper_engine.py` unchanged since
+7c47b3c140); only the benchmark scripts changed.
+
+```bash
+export N_TASKS=64
+for r in "kv:24 cbt1.5:24" "cbt2:24 cbk2:24" "cb:24 kv:24"; do
+  ( set -o pipefail; ./sweep_parallel.sh e2 "$r" 2>&1 | tee -a /scratch/$USER/engine_ab.log ) || break
+done
+python3 tradeoff_report.py --sweep e1 --sweep e2 --suite=-mm --n-tasks 64 \
+    --root $REPO/harbor_ab-mm --agents 24
+```
+
+`kv` runs in slot 0 in round 1 and slot 1 in round 3, so a GPU-half effect
+averages out of the baseline.
+
+### What each outcome means
+
+- **One or more acceptable points:** the feature ships default off with the
+  best such setting as the documented starting point, and the curve in the DEP.
+- **None, but the `cb` replicate lands within the limits:** e1's 24-agent cost
+  was mostly noise; report both runs and the measured spread.
+- **None:** at 24 agents no tested setting buys interactive latency at an
+  acceptable cost; report the curve and the 28-agent pass, and keep the
+  feature as an experimental opt-in or stop there.
