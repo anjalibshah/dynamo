@@ -57,16 +57,21 @@ else is re-run.
 
 ## Session
 
-About 4 hours of 8 H200 GPUs on h200-2: a 30-minute smoke test, then three
-rounds of about an hour (two 4-GPU slots per round).
+About 4 hours of 8 H200 GPUs on gpu-04 (host h200-r2-1): a 30-minute smoke
+test, then three rounds of about an hour (two 4-GPU slots per round). It must
+be the node that ran s1/s2: `/scratch` is node-local, and the MiniMax weights
+(`/scratch/$USER/hf_local`), the container image and Harbor live there.
 
 ### Setup
 
 ```bash
-salloc --nodelist=gpu-02 --gres=gpu:8 --time=6:00:00
-cd /scratch/$USER/src/dynamo-rebased && git pull && git log -1 --oneline
+salloc --nodelist=gpu-04 --gres=gpu:8 --time=6:00:00
+hostname; ls /scratch/$USER/hf_local >/dev/null && echo weights ok
+cd /scratch/$USER/src/dynamo && git fetch origin && git status -sb | head -1
+# on feat/agentic-taper-rebased: git pull; otherwise add a worktree:
+#   git worktree add /scratch/$USER/src/dynamo-rebased origin/feat/agentic-taper-rebased
 source ~/mm_env.sh
-export REPO=/scratch/$USER/src/dynamo-rebased PY=/scratch/$USER/src/dynamo/.venv/bin/python3
+export REPO=<that checkout> PY=/scratch/$USER/src/dynamo/.venv/bin/python3
 export GPUS_PER_SLOT=4 VICTIM_PRIORITY=1 MOUNT_VLLM=1
 cd $REPO/benchmarks/agentic_taper
 ```
