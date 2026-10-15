@@ -40,4 +40,15 @@ class TaperScheduler(TaperSkipMixin, InstrumentedScheduler):
             logger.warning(
                 "taper.engine: the V2 model runner is not verified with decode skips"
             )
-        self._taper_init(TaperConfig.from_env(), unsupported="; ".join(unsupported))
+        model = getattr(
+            getattr(vllm_config, "model_config", None), "served_model_name", ""
+        )
+        dp_rank = getattr(
+            getattr(vllm_config, "parallel_config", None), "data_parallel_rank", 0
+        )
+        self._taper_init(
+            TaperConfig.from_env(),
+            unsupported="; ".join(unsupported),
+            model_name=model if isinstance(model, str) else str(model),
+            dp_rank=dp_rank or 0,
+        )

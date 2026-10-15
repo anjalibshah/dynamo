@@ -78,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 MODES = ("off", "class_blind", "role_aware")
 EXTRA_ARGS_KEY = "dynamo_taper"
+# Prometheus family (dynamo.prometheus_names.name_prefix.COMPONENT + suffix),
+# written from the EngineCore process through PROMETHEUS_MULTIPROC_DIR and
+# forwarded by the worker's /metrics like the embedding-cache connector's.
+DECODE_REGULATION_METRIC_PREFIX = "dynamo_component_decode_regulation"
 ROLE_MAIN = "main"
 ROLE_SUB = "sub"
 
@@ -446,12 +450,23 @@ class TaperSkipMixin:
     ``update_from_output()`` with vLLM v0.31.0 semantics."""
 
     def _taper_init(
-        self, cfg: Optional[TaperConfig] = None, *, unsupported: str = ""
+        self,
+        cfg: Optional[TaperConfig] = None,
+        *,
+        unsupported: str = "",
+        model_name: str = "",
+        dp_rank: int = 0,
+        metrics_registry: Any = None,
     ) -> None:
         self._taper_cfg = cfg or TaperConfig.from_env()
         if unsupported and self._taper_cfg.enabled:
             logger.warning("taper.engine disabled: %s", unsupported)
             self._taper_cfg.mode = "off"
+        self._taper_metrics = (
+            RegulationMetrics.create(model_name, dp_rank, metrics_registry)
+            if self._taper_cfg.enabled
+            else None
+        )
         self._taper = TaperPolicy(self._taper_cfg)
         self._taper_pending: deque = (
             deque()
@@ -495,7 +510,10 @@ class TaperSkipMixin:
             for rid in d.skip:
                 req = by_id[rid]
                 req.next_decode_eligible_step = max(req.next_decode_eligible_step, nxt)
-        self._taper_stats.on_overhead(time.perf_counter() - t_start)
+        elapsed = time.perf_counter() - t_start
+        self._taper_stats.on_overhead(elapsed)
+        if self._taper_metrics is not None:
+            self._taper_metrics.on_decision(d, elapsed)
         return d
 
     def _taper_prefill_estimate(self) -> int:
@@ -548,6 +566,8 @@ class TaperSkipMixin:
         self._taper_last_update = now
         if decode_only and n:
             self._taper.observe(pred, actual)
+            if self._taper_metrics is not None:
+                self._taper_metrics.bias.set(self._taper.bias)
             self._taper_stats.on_step(pred, actual)
             self._taper_failsafe()
         if self._taper_trace is not None:
@@ -601,6 +621,8 @@ class TaperSkipMixin:
             )
             self._taper_cfg.mode = "off"
             self._taper_stats.disabled = True
+            if self._taper_metrics is not None:
+                self._taper_metrics.enabled.set(0)
 
     def _taper_close(self) -> None:
         if self._taper_trace is not None:
@@ -624,6 +646,79 @@ class TaperSkipMixin:
     def shutdown(self) -> None:
         self._taper_close()
         super().shutdown()
+
+
+class RegulationMetrics:
+    """Prometheus series for decode regulation, per (model, dp_rank).
+
+    Counted in request-steps (one request in one scheduler step):
+    ``skipped_total / regulated_total`` is the share of low-priority decode
+    work deferred, ``engaged_steps_total / steps_total`` how often the worker
+    ran overloaded. ``enabled`` drops to 0 when the fail-open guard trips."""
+
+    def __init__(self, model_name: str, dp_rank: int, registry: Any) -> None:
+        from prometheus_client import CollectorRegistry, Counter, Gauge
+
+        registry = registry if registry is not None else CollectorRegistry()
+        names = ["model", "dp_rank"]  # dynamo_* hierarchy labels are injected
+        values = {"model": model_name, "dp_rank": str(dp_rank)}
+        p = DECODE_REGULATION_METRIC_PREFIX
+
+        def counter(name: str, doc: str):
+            return Counter(f"{p}_{name}", doc, names, registry=registry).labels(
+                **values
+            )
+
+        def gauge(name: str, doc: str):
+            return Gauge(
+                f"{p}_{name}",
+                doc,
+                names,
+                registry=registry,
+                multiprocess_mode="mostrecent",
+            ).labels(**values)
+
+        self.steps = counter("steps_total", "Scheduler steps evaluated.")
+        self.engaged = counter(
+            "engaged_steps_total", "Steps where the batch broke the target."
+        )
+        self.interactive = counter(
+            "interactive_total", "Decode request-steps never regulated."
+        )
+        self.regulated = counter(
+            "regulated_total", "Decode request-steps eligible for regulation."
+        )
+        self.skipped = counter("skipped_total", "Decode request-steps skipped.")
+        self.forced = counter(
+            "forced_total", "Request-steps run by the progress bound (K)."
+        )
+        self.decision = counter(
+            "decision_seconds_total", "Time spent choosing the step's decodes."
+        )
+        self.enabled = gauge("enabled", "1 while regulating, 0 after fail-open.")
+        self.bias = gauge("step_time_bias", "Actual / predicted step time (EWMA).")
+        self.enabled.set(1)
+        self.bias.set(1.0)
+
+    @classmethod
+    def create(
+        cls, model_name: str, dp_rank: int, registry: Any = None
+    ) -> Optional["RegulationMetrics"]:
+        try:
+            return cls(model_name, dp_rank, registry)
+        except ImportError:
+            logger.debug("prometheus_client unavailable: no decode regulation metrics")
+            return None
+
+    def on_decision(self, d: Decision, seconds: float) -> None:
+        self.steps.inc()
+        self.decision.inc(seconds)
+        self.interactive.inc(d.n_interactive)
+        self.regulated.inc(d.n_managed)
+        if d.engaged:
+            self.engaged.inc()
+            self.skipped.inc(len(d.skip))
+            self.forced.inc(d.n_forced)
 
 
 class _Stats:

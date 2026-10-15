@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from dynamo.vllm.taper_engine import (
+    DECODE_REGULATION_METRIC_PREFIX,
     EXTRA_ARGS_KEY,
     Cand,
     TaperConfig,
@@ -306,6 +307,34 @@ def test_summary_counts_both_classes():
     step(s)
     line = s._taper_stats.summary_and_reset(1.0)
     assert "interactive=1 regulated=3 " in line
+
+
+def test_prometheus_series():
+    prometheus_client = pytest.importorskip("prometheus_client")
+    registry = prometheus_client.CollectorRegistry()
+    reqs = overloaded()
+    s = Sched([], cfg(failsafe_steps=2))
+    s._taper_init(
+        cfg(failsafe_steps=2), model_name="m", dp_rank=1, metrics_registry=registry
+    )
+    s.running = reqs
+    step(s)
+
+    def value(name):
+        return registry.get_sample_value(
+            f"{DECODE_REGULATION_METRIC_PREFIX}_{name}", {"model": "m", "dp_rank": "1"}
+        )
+
+    assert value("steps_total") == 1
+    assert value("engaged_steps_total") == 1
+    assert value("interactive_total") == 1
+    assert value("regulated_total") == len(reqs) - 1
+    assert value("skipped_total") == 4  # as in the overload test above
+    assert value("enabled") == 1
+    s._taper.bias = 2.0
+    s._taper_failsafe()
+    s._taper_failsafe()
+    assert value("enabled") == 0
 
 
 def test_failsafe_disables_when_bias_stays_pinned():

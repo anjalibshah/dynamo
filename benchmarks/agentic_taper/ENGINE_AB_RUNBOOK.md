@@ -74,13 +74,18 @@ cd $REPO/benchmarks/agentic_taper
 ### Step 0: smoke test (plumbing only, no overload)
 
 ```bash
-N_TASKS=2 ./sweep_parallel.sh e0 "cb:2 kv:2"
+N_TASKS=2 ./sweep_parallel.sh e0 "cb:2 kv:2" &
+# while it runs (cb is slot 0, so its worker serves /metrics on port 8181):
+watch -n 30 "curl -s localhost:8181/metrics | grep '^dynamo_component_decode_regulation'"
+# after it finishes:
 grep -m1 'taper.engine mode=' $REPO/harbor_ab-mm/swe0-cb-n2/stack.log
 grep 'taper.engine steps=' $REPO/harbor_ab-mm/swe0-cb-n2/stack.log | tail -2
 ```
 
 Go on only if: both stacks became ready, the cb log shows
-`taper.engine mode=class_blind`, the summary lines show both
+`taper.engine mode=class_blind`, `/metrics` showed the
+`dynamo_component_decode_regulation_*` series with `enabled` 1 and
+`interactive_total` and `regulated_total` growing, the summary lines show both
 `interactive=` and `regulated=` above 0 (the priority reaches the engine and
 classifies both ways), `pred_err_p50` is under about 15%, and there is no
 `taper.engine disabled`. If the cb stack

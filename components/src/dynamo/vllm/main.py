@@ -52,6 +52,7 @@ from dynamo.runtime import Endpoint
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.kv_hints import publish_kv_hint_capabilities
 from dynamo.vllm.nixl_telemetry import allow_nixl_telemetry_capture
+from dynamo.vllm.taper_engine import DECODE_REGULATION_METRIC_PREFIX, TaperConfig
 from dynamo.vllm.worker_factory import WorkerFactory
 
 from . import envs
@@ -312,6 +313,10 @@ def setup_metrics_collection(
         == "DynamoMultimodalEmbeddingCacheConnector"
     ):
         engine_metric_prefixes.append(EMBEDDING_CACHE_METRIC_PREFIX)
+    # TaperScheduler (EngineCore process) writes its decode regulation series
+    # to the multiprocess .db files, like the embedding cache connector.
+    if TaperConfig.from_env().enabled:
+        engine_metric_prefixes.append(DECODE_REGULATION_METRIC_PREFIX)
 
     if config.engine_args.disable_log_stats is False:
         # Register the dedicated dynamo_component registry callback
