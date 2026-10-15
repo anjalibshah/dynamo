@@ -49,8 +49,16 @@ protection), to see how much of oracle_blind's gain an engine could capture:
                tokens served so far across the session's requests; Autellix-style)
   las_task     least attained service of the request's task first (Autellix PLAS)
   ctx          smallest context first
+  mas          most attained service of the request's session first (the
+               opposite of las: when sessions are of similar size, the one
+               furthest along has the least left)
+  mas_task     most attained service of the request's task first
+  predX        a learned predictor called once per session, at its start: the
+               session's total decode work times exp(N(0, X)), minus what the
+               session has been served since (floored at 0), e.g. pred0.5
   noisyX       oracle_blind's remaining work times exp(N(0, X)), drawn once per
-               request (a learned predictor with log-error sigma X), e.g. noisy0.5
+               request. An upper bound, not a predictor: the estimate still
+               shrinks exactly as the work is done (use predX for a predictor)
 
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
@@ -287,7 +295,8 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
     pol = None
-    proxy = policy in ("las", "las_task", "ctx") or policy.startswith("noisy")
+    proxy = (policy in ("las", "las_task", "mas", "mas_task", "ctx")
+             or policy.startswith(("noisy", "pred")))
     if policy in ("oracle", "oracle_blind"):
         pol = oracle_policy(eng, cfg, policy == "oracle")
     elif proxy:
@@ -313,6 +322,13 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
         sigma = float(policy[len("noisy"):])
         erng = random.Random(seed + 1)
         err = {r.i: math.exp(erng.gauss(0.0, sigma)) for r in reqs}
+    if policy.startswith("pred"):
+        sigma = float(policy[len("pred"):])
+        erng = random.Random(seed + 1)
+        total = defaultdict(int)
+        for r in reqs:
+            total[r.session] += r.need
+        err = {s: w * math.exp(erng.gauss(0.0, sigma)) for s, w in sorted(total.items())}
     ctx = {r.i: r.inp + 1 for r in reqs}
     skip_run = defaultdict(int)
     prefill_q: deque = deque()  # [index, remaining new tokens]
@@ -346,8 +362,15 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
                     pol.score = {i: att_session[reqs[i].session] for i in active}
                 elif policy == "las_task":
                     pol.score = {i: att_task[reqs[i].task] for i in active}
+                elif policy == "mas":
+                    pol.score = {i: -att_session[reqs[i].session] for i in active}
+                elif policy == "mas_task":
+                    pol.score = {i: -att_task[reqs[i].task] for i in active}
                 elif policy == "ctx":
                     pol.score = {i: ctx[i] for i in active}
+                elif policy.startswith("pred"):
+                    pol.score = {i: max(0.0, err[reqs[i].session] - att_session[reqs[i].session])
+                                 for i in active}
                 else:
                     pol.score = {i: (left[i] + reqs[i].future) * err[i] for i in active}
             if pol.__class__.__name__ == "OraclePolicy":
@@ -537,7 +560,7 @@ def main() -> None:
                     help="step token budget; default: from fpm.jsonl, else 8192")
     ap.add_argument("--rhos", default="0.6,0.8,1.0")
     ap.add_argument("--policies",
-                    default="class_blind,oracle_blind,las,las_task,ctx,noisy0.5,noisy1")
+                    default="class_blind,oracle_blind,mas,mas_task,pred0.5,pred1,noisy1")
     ap.add_argument("--levels", default="0.5,0.8,0.9,0.95")
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--max-opp-ctx", type=int, default=0)
