@@ -22,6 +22,17 @@
 #   cap2    at most 2 in-flight requests per task
 #   taper   one protected request per task + slack admission (needs PRED_COEFFS)
 #   shadow  taper decisions counted but never applied (pilot)
+# or an engine-level arm (ENGINE_AB_RUNBOOK.md):
+#   prio    stock, plus vLLM --scheduling-policy priority (Dynamo's existing
+#           priority feature; needs VICTIM_PRIORITY)
+#   cb      class-blind per-step decode regulation (TaperScheduler,
+#           DYN_TAPER_ENGINE=class_blind) classifying by priority: requests with
+#           priority >= PRIORITY_MIN get the ITL target (needs VICTIM_PRIORITY)
+# VICTIM_PRIORITY stamps nvext.agent_hints.priority on every interactive
+# request (set it for every arm of a comparison so request bodies match).
+# MOUNT_VLLM=1 mounts this checkout's components/src/dynamo/vllm over the
+# image's, so every arm runs the same backend code (needed for cb on an image
+# built before TaperScheduler).
 # AGENT selects the coding agent (Harbor -a): claude-code (default), opencode
 # (OpenCode, pinned OC_VERSION, default prompt and subagents), or omo (OpenCode
 # plus the oh-my-opencode plugin, pinned OMO_VERSION, ultrawork on by default
@@ -51,6 +62,13 @@ CTX_BUDGET="${CTX_BUDGET:-300000}"
 # Step-time model "a,b,c" (ms; T = a + b*n + c*L) for the taper/shadow arms,
 # from fit_step_model.py on the calibration runs.
 PRED_COEFFS="${PRED_COEFFS:-}"
+VICTIM_PRIORITY="${VICTIM_PRIORITY:-}"
+PRIORITY_MIN="${PRIORITY_MIN:-1}"
+MOUNT_VLLM="${MOUNT_VLLM:-0}"
+# Engine step-time model for the cb arm (empty: TaperConfig defaults, fitted on
+# MiniMax-M2 TP4 H200): "a,b,c" decode and "q,p" prefill, in ms (p per token).
+ENGINE_COEFFS="${ENGINE_COEFFS:-}"
+ENGINE_PREFILL_COEFFS="${ENGINE_PREFILL_COEFFS:-17.5,0.035}"
 AGENT="${AGENT:-claude-code}"
 OC_VERSION="${OC_VERSION:-1.19.0}"     # 1.19.0 sends each subagent's own x-session-id
 OMO_VERSION="${OMO_VERSION:-5.1.32}"
@@ -71,6 +89,7 @@ JP="harbor-ab$SUITE"
 OUT_REL="harbor_ab$SUITE"
 OUT="$REPO/$OUT_REL"
 SITE=/usr/local/lib/python3.12/dist-packages/dynamo/taper_router
+SITE_VLLM=/usr/local/lib/python3.12/dist-packages/dynamo/vllm
 PY="${PY:-$REPO/.venv/bin/python3}"   # any python3 with aiohttp
 # vLLM TP>1 workers share state via /dev/shm; podman's 64 MB default is too
 # small (MiniMax-M2 TP4 needs >160 MB). Harmless for TP1.
@@ -119,10 +138,16 @@ trap 'cleanup; exit 130' INT TERM
 echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION:-none (natural)}]"
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
-    case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow) ;;
+    case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow|prio|cb) ;;
         *) echo "bad arm in ${SPEC[$s]}" >&2; exit 2 ;; esac
     if [[ ( "$arm" == taper || "$arm" == shadow ) && -z "$PRED_COEFFS" ]]; then
         echo "arm $arm needs PRED_COEFFS=a,b,c" >&2; exit 2
+    fi
+    if [[ ( "$arm" == prio || "$arm" == cb ) && -z "$VICTIM_PRIORITY" ]]; then
+        echo "arm $arm needs VICTIM_PRIORITY (e.g. 1)" >&2; exit 2
+    fi
+    if [[ "$arm" == cb ]] && (( VICTIM_PRIORITY < PRIORITY_MIN )); then
+        echo "arm cb: VICTIM_PRIORITY=$VICTIM_PRIORITY < PRIORITY_MIN=$PRIORITY_MIN would regulate the interactive requests" >&2; exit 2
     fi
     run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 100 * s))
     if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "slot $s: skip $run (done)"; RUN[$s]=""; continue; fi
@@ -130,6 +155,7 @@ for s in "${!SPEC[@]}"; do
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl" "$OUT/$run/fpm.jsonl"
     extra=()
     policy=kv
+    vllm_args="$EXTRA_VLLM_ARGS"
     case "$arm" in
         ctx) policy=taper
              extra=(-e "DYN_TAPER_LOAD_THRESHOLD=$CTX_THRESHOLD" -e "DYN_TAPER_CONTEXT_BUDGET_TOKENS=$CTX_BUDGET") ;;
@@ -138,7 +164,13 @@ for s in "${!SPEC[@]}"; do
         taper|shadow) policy=taper
              extra=(-e DYN_TAPER_MODE=taper -e "DYN_TAPER_PREDICTOR_COEFFS=$PRED_COEFFS")
              [[ "$arm" == shadow ]] && extra+=(-e DYN_TAPER_SHADOW_MODE=true) ;;
+        prio) vllm_args="$vllm_args --scheduling-policy priority" ;;
+        cb) extra=(-e DYN_TAPER_ENGINE=class_blind -e "DYN_TAPER_PRIORITY_MIN=$PRIORITY_MIN"
+                   -e "DYN_TAPER_PREFILL_COEFFS=$ENGINE_PREFILL_COEFFS"
+                   -e "DYN_TAPER_TRACE=/workspace/$OUT_REL/$run/taper_engine.jsonl")
+            [[ -n "$ENGINE_COEFFS" ]] && extra+=(-e "DYN_TAPER_COEFFS=$ENGINE_COEFFS") ;;
     esac
+    (( MOUNT_VLLM )) && extra+=(-v "$REPO/components/src/dynamo/vllm:$SITE_VLLM")
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
     for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=$g"); done
@@ -146,7 +178,7 @@ for s in "${!SPEC[@]}"; do
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" -e "GPUS=$IN_GPUS" -e "TP=$GPUS_PER_SLOT" \
-        -e "EXTRA_VLLM_ARGS=$EXTRA_VLLM_ARGS" \
+        -e "EXTRA_VLLM_ARGS=$vllm_args" \
         -e "TOOL_PARSER=$TOOL_PARSER" -e "REASONING_PARSER=$REASONING_PARSER" -e ANTHROPIC_API=1 \
         -e "PORT_OFFSET=$((100 * s))" \
         -e DYN_REQUEST_TRACE=1 -e DYN_REQUEST_TRACE_SINKS=jsonl \
@@ -173,7 +205,8 @@ for s in "${!SPEC[@]}"; do
         > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
     "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$url" --model "$MODEL" \
         --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
-        --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 > "$OUT/$run/victim_client.log" 2>&1 &
+        --mean-arrival-ms "$VICTIM_MEAN_MS" --seed 0 \
+        ${VICTIM_PRIORITY:+--priority "$VICTIM_PRIORITY"} > "$OUT/$run/victim_client.log" 2>&1 &
     VPID[$s]=$!
     if [[ "$AGENT" == claude-code ]]; then
         agent_args=(-a claude-code -m "$MODEL"
@@ -212,6 +245,11 @@ for s in "${!SPEC[@]}"; do
     if [[ "$run" == *-ctx-* ]]; then
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" defers=$(grep -c 'taper.defer' <<<"$log" || true) forced=$(grep -c 'taper.forced_admit' <<<"$log" || true)"
+    fi
+    if [[ "$run" == *-cb-* ]]; then
+        log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
+        gate=" engine: $(grep -o 'taper.engine steps=.*' <<<"$log" | tail -1 || true)"
+        grep -q 'taper.engine disabled' <<<"$log" && gate+=" [DISABLED: $(grep -m1 -o 'taper.engine disabled.*' <<<"$log")]"
     fi
     echo "slot $s: $run finished ($(date -u +%H:%M:%S))$gate"
 done

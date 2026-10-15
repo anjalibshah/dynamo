@@ -244,6 +244,7 @@ class Decision:
     n_demoted: int = 0
     n_opp: int = 0
     n_managed: int = 0  # regulated (non-interactive) decode-phase requests
+    n_interactive: int = 0  # decode-phase requests never skipped
 
 
 def _ceil_quarter(w: int) -> int:
@@ -337,6 +338,8 @@ class TaperPolicy:
             return self._commit(d, cands)
 
         managed = [c for c in cands if not c.interactive and c.task is not None]
+        d.n_managed = len(managed)
+        d.n_interactive = len(cands) - len(managed)
         by_task: dict = {}
         for c in managed:
             by_task.setdefault(c.task, []).append(c)
@@ -353,7 +356,6 @@ class TaperPolicy:
             return self._commit(d, cands)
 
         d.engaged = True
-        d.n_managed = len(managed)
         protected = self._protected(by_task) if self.cfg.mode == "role_aware" else set()
         base_ids = {
             c.req_id for c in cands if c.interactive or c.task is None
@@ -478,6 +480,7 @@ class TaperSkipMixin:
     def _taper_apply(self) -> Optional[Decision]:
         if not self._taper_cfg.enabled or getattr(self, "_bench_active", False):
             return None
+        t_start = time.perf_counter()
         by_id = {}
         cands = []
         for req in self.running:
@@ -492,6 +495,7 @@ class TaperSkipMixin:
             for rid in d.skip:
                 req = by_id[rid]
                 req.next_decode_eligible_step = max(req.next_decode_eligible_step, nxt)
+        self._taper_stats.on_overhead(time.perf_counter() - t_start)
         return d
 
     def _taper_prefill_estimate(self) -> int:
@@ -631,19 +635,26 @@ class _Stats:
     def reset(self) -> None:
         self.steps = self.engaged = self.skipped = self.forced = 0
         self.regulated = 0  # regulated request-steps seen while engaged
+        self.seen_interactive = self.seen_regulated = 0  # request-steps, all steps
         self.max_skip_run = 0
         self.err = []
+        self.overhead_us = []
         self.disabled = getattr(self, "disabled", False)
 
     def on_decision(self, d: Decision, policy: TaperPolicy) -> None:
         self.steps += 1
         self.engaged += d.engaged
+        self.seen_interactive += d.n_interactive
+        self.seen_regulated += d.n_managed
         if d.engaged:
             self.regulated += d.n_managed
         self.skipped += len(d.skip)
         self.forced += d.n_forced
         for rid in d.skip:
             self.max_skip_run = max(self.max_skip_run, policy.skip_run(rid))
+
+    def on_overhead(self, seconds: float) -> None:
+        self.overhead_us.append(seconds * 1e6)
 
     def on_step(self, pred: float, actual: float) -> None:
         self.err.append(abs(pred - actual) / actual)
@@ -652,11 +663,14 @@ class _Stats:
         e = sorted(self.err)
         mape = f"{e[len(e) // 2]:.1%}" if e else "-"
         share = f"{self.skipped / self.regulated:.1%}" if self.regulated else "-"
+        o = sorted(self.overhead_us)
+        over = f"{o[len(o) // 2]:.0f}/{o[99 * len(o) // 100]:.0f}us" if o else "-"
         s = (
-            f"steps={self.steps} engaged={self.engaged} skipped={self.skipped} "
+            f"steps={self.steps} interactive={self.seen_interactive} "
+            f"regulated={self.seen_regulated} engaged={self.engaged} skipped={self.skipped} "
             f"skip_share={share} forced={self.forced} "
-            f"max_skip_run={self.max_skip_run} pred_err_p50={mape} bias={bias:.3f}"
-            + (" DISABLED" if self.disabled else "")
+            f"max_skip_run={self.max_skip_run} pred_err_p50={mape} bias={bias:.3f} "
+            f"decide_p50/p99={over}" + (" DISABLED" if self.disabled else "")
         )
         self.reset()
         return s

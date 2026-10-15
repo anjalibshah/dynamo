@@ -111,7 +111,8 @@ class VictimClient:
                  session_prefix: str = "victim", arm: str = "", max_tokens: int = 64,
                  timeout_s: float = 60.0, max_conns: int = 32,
                  itl_target_ms: Optional[float] = None,
-                 ttft_target_ms: Optional[float] = None):
+                 ttft_target_ms: Optional[float] = None,
+                 priority: Optional[int] = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.path = path
@@ -122,6 +123,7 @@ class VictimClient:
         self.max_conns = max_conns
         self.itl_target_ms = itl_target_ms
         self.ttft_target_ms = ttft_target_ms
+        self.priority = priority
         self._session = None
         self._sema: Optional[asyncio.Semaphore] = None
 
@@ -157,6 +159,8 @@ class VictimClient:
             if self.ttft_target_ms is not None:
                 router["ttft_target"] = self.ttft_target_ms
             nvext["router"] = router
+        if self.priority is not None:
+            nvext["agent_hints"] = {"priority": self.priority}
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -220,6 +224,7 @@ async def run(args: argparse.Namespace) -> list[VictimTiming]:
         session_prefix=args.session_prefix, arm=args.arm, max_tokens=args.max_tokens,
         timeout_s=args.timeout_s, max_conns=args.max_conns,
         itl_target_ms=args.itl_target_ms, ttft_target_ms=args.ttft_target_ms,
+        priority=args.priority,
     )
     loop = asyncio.get_event_loop()
     step_ms = args.mean_arrival_ms / max(args.burst_multiplier, 1e-9)
@@ -295,6 +300,9 @@ def main() -> None:
                     help="stamped as nvext.router.itl_target when set (brief Appendix D)")
     p.add_argument("--ttft-target-ms", type=float, default=None,
                     help="stamped as nvext.router.ttft_target when set")
+    p.add_argument("--priority", type=int, default=None,
+                    help="stamped as nvext.agent_hints.priority when set (Dynamo priority: "
+                         "higher is more important)")
     p.add_argument("--prompts-file", default=None,
                     help="one prompt per line; overrides the built-in pool")
     p.add_argument("--shuffle-prompts", action="store_true",

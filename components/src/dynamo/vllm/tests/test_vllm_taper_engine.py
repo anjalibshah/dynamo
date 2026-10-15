@@ -298,6 +298,16 @@ def test_priority_mode_regulates_plain_low_priority_requests():
     assert len(scheduled) < len(reqs)  # each plain request is its own task
 
 
+def test_summary_counts_both_classes():
+    reqs = overloaded(n_subs=2, ctx=10_000)
+    s = Sched(reqs, cfg("class_blind", priority_min=1))
+    for r in reqs[1:]:
+        r.sampling_params.extra_args = {EXTRA_ARGS_KEY: {"interactive": False}}
+    step(s)
+    line = s._taper_stats.summary_and_reset(1.0)
+    assert "interactive=1 regulated=3 " in line
+
+
 def test_failsafe_disables_when_bias_stays_pinned():
     s = Sched(overloaded(), cfg(failsafe_steps=3))
     s._taper.bias = 2.0
