@@ -98,7 +98,15 @@ SHM_SIZE="${SHM_SIZE:-32g}"
 SOCK="${XDG_RUNTIME_DIR:?source ~/.bashrc first}/podman/podman.sock"
 [[ -S "$SOCK" ]] || { echo "podman API socket $SOCK not running" >&2; exit 2; }
 read -r -a SPEC <<<"$SPECS"
-NGPU=$(nvidia-smi -L | wc -l)
+# GPU_IDS: comma-separated host GPU indices (or UUIDs) the slots use, in
+# order; default all GPUs from 0. Set it when another job shares the node,
+# e.g. GPU_IDS=4,5,6,7 (check `nvidia-smi` for the GPUs in use).
+if [[ -n "${GPU_IDS:-}" ]]; then
+    IFS=, read -r -a GPU_LIST <<<"$GPU_IDS"
+else
+    mapfile -t GPU_LIST < <(seq 0 $(( $(nvidia-smi -L | wc -l) - 1 )))
+fi
+NGPU=${#GPU_LIST[@]}
 (( ${#SPEC[@]} * GPUS_PER_SLOT <= NGPU )) || { echo "${#SPEC[@]} slots x $GPUS_PER_SLOT GPUs > $NGPU GPUs" >&2; exit 2; }
 IN_GPUS=$(seq -s, 0 $((GPUS_PER_SLOT - 1)))
 mkdir -p "$OUT"
@@ -173,7 +181,7 @@ for s in "${!SPEC[@]}"; do
     (( MOUNT_VLLM )) && extra+=(-v "$REPO/components/src/dynamo/vllm:$SITE_VLLM")
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
-    for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=$g"); done
+    for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=${GPU_LIST[$g]}"); done
     CID[$s]=$(podman run -d --rm --init --network host "${dev[@]}" --shm-size "$SHM_SIZE" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
@@ -185,7 +193,7 @@ for s in "${!SPEC[@]}"; do
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" \
         ${extra[@]+"${extra[@]}"} "$IMAGE" \
         bash -c "cd /workspace && ./components/src/dynamo/taper_router/run_smoketest_1gpu.sh $policy > /workspace/$OUT_REL/$run/stack.log 2>&1")
-    echo "slot $s: $run on GPUs $((s * GPUS_PER_SLOT))-$(((s + 1) * GPUS_PER_SLOT - 1)), port ${PORT[$s]}"
+    echo "slot $s: $run on GPUs ${GPU_LIST[*]:$((s * GPUS_PER_SLOT)):GPUS_PER_SLOT}, port ${PORT[$s]}"
 done
 
 for s in "${!SPEC[@]}"; do
