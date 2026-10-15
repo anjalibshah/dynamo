@@ -20,7 +20,7 @@ Pre-registered rule (defaults below), at every agent count with all three arms:
   R3  cb task p90 / kv task p90 <= 1.40
   R4  cb throughput / kv throughput >= 0.90
   R5  cb ran regulated: not failed open, median step-time error <= 15%,
-      decision time p99 <= 1000 us (from the last taper.engine log line)
+      decision time p99 <= 1000 us (over all taper.engine summary lines)
 
 PASS if R1-R5 hold at every agent count. --noise-sweeps prints the kv-vs-kv
 spread between earlier sweeps at the same agent count, to read R3/R4 against.
@@ -59,23 +59,56 @@ def pct(xs: list[float], q: float) -> float:
 
 
 def engine_health(root: str, run: str) -> dict:
-    """The last taper.engine summary line of a cb run's stack.log."""
+    """All taper.engine summary lines of a cb run's stack.log, combined.
+
+    Each summary line covers one log interval (counters reset after it), so the
+    last line alone describes only the tail of the run. Counts are summed over
+    lines; step-time error is the median of the per-line medians, weighted by
+    steps; decision time p99 is the worst per-line p99.
+    """
     path = os.path.join(root, run, "stack.log")
     h = {"disabled": False, "pred_err": None, "decide_p99_us": None, "line": ""}
     if not os.path.exists(path):
         return h
+    tot = defaultdict(int)
+    errs, p99s, max_run, n_lines = [], [], 0, 0
     for line in open(path, errors="replace"):
         line = re.sub(r"\x1b\[[0-9;]*m", "", line)
         if "taper.engine disabled" in line:
             h["disabled"] = True
-        if "taper.engine steps=" in line:
-            h["line"] = line[line.index("steps="):].strip()
-    m = re.search(r"pred_err_p50=([\d.]+)%", h["line"])
-    if m:
-        h["pred_err"] = float(m.group(1)) / 100
-    m = re.search(r"decide_p50/p99=\d+/(\d+)us", h["line"])
-    if m:
-        h["decide_p99_us"] = float(m.group(1))
+        if "taper.engine steps=" not in line:
+            continue
+        n_lines += 1
+        kv = dict(re.findall(r"(\w+(?:/\w+)?)=(\S+)", line[line.index("steps="):]))
+        for k in ("steps", "interactive", "regulated", "engaged", "skipped", "forced"):
+            tot[k] += int(kv.get(k, 0))
+        max_run = max(max_run, int(kv.get("max_skip_run", 0)))
+        m = re.match(r"([\d.]+)%", kv.get("pred_err_p50", ""))
+        if m:
+            errs.append((float(m.group(1)) / 100, int(kv.get("steps", 0))))
+        m = re.match(r"\d+/(\d+)us", kv.get("decide_p50/p99", ""))
+        if m:
+            p99s.append(float(m.group(1)))
+    if errs:
+        errs.sort()
+        half, acc = sum(w for _, w in errs) / 2, 0
+        for e, w in errs:
+            acc += w
+            if acc >= half:
+                h["pred_err"] = e
+                break
+    if p99s:
+        h["decide_p99_us"] = max(p99s)
+    if n_lines:
+        share = f"{tot['skipped'] / tot['regulated']:.1%}" if tot["regulated"] else "-"
+        err = "-" if h["pred_err"] is None else f"{h['pred_err']:.1%}"
+        h["line"] = (
+            f"{n_lines} intervals: steps={tot['steps']} interactive={tot['interactive']} "
+            f"regulated={tot['regulated']} engaged={tot['engaged']} skipped={tot['skipped']} "
+            f"skip_share~{share} forced={tot['forced']} max_skip_run={max_run} "
+            f"pred_err_p50={err} "
+            f"decide_p99_max={h['decide_p99_us'] or 0:.0f}us"
+        )
     return h
 
 
