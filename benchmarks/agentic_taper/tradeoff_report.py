@@ -11,7 +11,8 @@ Each regulated arm is one point on the curve, compared with the mean of all
 kv runs at the same agent count:
 
   own target   interactive share meeting the arm's own deadline
-               (500 ms + 3 * m * 4.95 ms * (tokens - 1); m = 1 except cbt<m>)
+               (500 ms + 3 * m * 6.16 ms * (tokens - 1); m = 1 except cbt<m>;
+               6.16 ms is MiniMax-M2's unloaded interactive ITL p50, NEXT_STEPS 7.3j)
   nominal      interactive share meeting the default deadline (m = 1)
   task p90     agent task wall time p90 / kv's
   throughput   tasks per hour to T80 / kv's
@@ -60,7 +61,8 @@ def main() -> None:
     p.add_argument("--agents", type=int, default=24)
     p.add_argument("--n-tasks", type=int, default=64)
     p.add_argument("--factor", type=float, default=3.0)
-    p.add_argument("--anchor-ms", type=float, default=4.95)
+    p.add_argument("--anchor-ms", type=float, default=6.16,
+                   help="unloaded interactive ITL p50, ms (MiniMax-M2 TP4 H200: 6.16)")
     p.add_argument("--ttft-ms", type=float, default=500.0)
     p.add_argument("--min-interactive", type=float, default=0.80)
     p.add_argument("--min-over-prio", type=float, default=0.30)

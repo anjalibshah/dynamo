@@ -40,6 +40,13 @@ Scored by `engine_ab_report.py` with `sweep_report.py`'s definitions
 (window: first agent start to the 52nd of 64 task completions, T80;
 interactive: end-to-end deadline 500 ms + 3 x 4.95 ms x (tokens - 1)).
 
+> **Anchor mistake (found 2026-10-15, after e1):** 4.95 ms is the GLM-4.7-Flash
+> anchor (NEXT_STEPS 7.3e). MiniMax-M2's unloaded interactive ITL p50 is
+> 6.16 ms (7.3j), which s1/s2 were scored with and which the engine's 18.48 ms
+> target is built from. e1 is reported as registered (4.95, a stricter
+> deadline) and also at 6.16 for comparison with s1/s2. R3-R5 do not depend
+> on the anchor. e2 below uses 6.16, fixed before any e2 data.
+
 | | Criterion | Why this threshold |
 |---|---|---|
 | R1 | cb interactive >= 0.80 | Stock is 0.12-0.17 (s1/s2); simulation predicts 0.92-0.97 |
@@ -163,7 +170,7 @@ an acceptable operating point if:
 
 | | Criterion |
 |---|---|
-| A1 | interactive share meeting the arm's own deadline (500 ms + 3 x m x 4.95 ms per token, m the target multiplier) >= 0.80 |
+| A1 | interactive share meeting the arm's own deadline (500 ms + 3 x m x 6.16 ms per token, m the target multiplier; 6.16 ms is MiniMax-M2's anchor) >= 0.80 |
 | A2 | that share minus `prio`'s at the same deadline >= 0.30 |
 | A3 | task p90 / kv <= 1.40 |
 | A4 | throughput / kv >= 0.90 |
