@@ -196,6 +196,18 @@ python3 tradeoff_report.py --sweep e1 --sweep e2 --suite=-mm --n-tasks 64 \
 `kv` runs in slot 0 in round 1 and slot 1 in round 3, so a GPU-half effect
 averages out of the baseline.
 
+**On 4 GPUs** (one slot, about 6 hours): one arm per round, stock first and
+last so drift over the session averages out of the baseline. The second
+stock run uses sweep tag `e2b` (a run is skipped if its name already exists).
+
+```bash
+for r in "e2 kv:24" "e2 cbt1.5:24" "e2 cbt2:24" "e2 cbk2:24" "e2 cb:24" "e2b kv:24"; do
+  ( set -o pipefail; ./sweep_parallel.sh ${r%% *} "${r#* }" 2>&1 | tee -a /scratch/$USER/engine_ab.log ) || break
+done
+python3 tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --suite=-mm --n-tasks 64 \
+    --root $REPO/harbor_ab-mm --agents 24
+```
+
 ### What each outcome means
 
 - **One or more acceptable points:** the feature ships default off with the
