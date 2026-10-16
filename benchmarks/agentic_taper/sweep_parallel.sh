@@ -4,7 +4,9 @@
 #
 # Load sweep (NEXT_STEPS 7.3i/7.3j): independent stacks run in parallel, one per
 # slot, each with its own arm and agent concurrency. Slot s uses GPUs
-# s*G .. s*G+G-1 (G = GPUS_PER_SLOT, the TP size) and PORT_OFFSET=100*s.
+# s*G .. s*G+G-1 (G = GPUS_PER_SLOT, the TP size) and PORT_OFFSET=PORT_BASE+100*s
+# (PORT_BASE default 0; e.g. 200 when another user holds 8100 on a shared node,
+# not 1000: node_exporter owns 9100).
 # MiniMax-M2 TP4: GPUS_PER_SLOT=4 SUITE=-mm MODEL_PATH=MiniMaxAI/MiniMax-M2.7
 #   MODEL=MiniMaxAI/MiniMax-M2 TOOL_PARSER=minimax_m2
 #   REASONING_PARSER=minimax_append_think EXTRA_VLLM_ARGS="--kv-cache-dtype fp8"
@@ -69,6 +71,7 @@ PRED_COEFFS="${PRED_COEFFS:-}"
 VICTIM_PRIORITY="${VICTIM_PRIORITY:-}"
 PRIORITY_MIN="${PRIORITY_MIN:-1}"
 MOUNT_VLLM="${MOUNT_VLLM:-0}"
+PORT_BASE="${PORT_BASE:-0}"
 # Engine step-time model for the cb arm (empty: TaperConfig defaults, fitted on
 # MiniMax-M2 TP4 H200): "a,b,c" decode and "q,p" prefill, in ms (p per token).
 ENGINE_COEFFS="${ENGINE_COEFFS:-}"
@@ -168,9 +171,9 @@ for s in "${!SPEC[@]}"; do
     if [[ "$arm" == cb* ]] && (( VICTIM_PRIORITY < PRIORITY_MIN )); then
         echo "arm cb: VICTIM_PRIORITY=$VICTIM_PRIORITY < PRIORITY_MIN=$PRIORITY_MIN would regulate the interactive requests" >&2; exit 2
     fi
-    run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + 100 * s))
+    run="sw$TAG-$arm-n$n"; RUN[$s]=$run; PORT[$s]=$((8100 + PORT_BASE + 100 * s))
     if [[ -d "$REPO/jobs/$JP-$run" ]]; then echo "slot $s: skip $run (done)"; RUN[$s]=""; continue; fi
-    ports_free $((100 * s)) || { cleanup; exit 2; }
+    ports_free $((PORT_BASE + 100 * s)) || { cleanup; exit 2; }
     mkdir -p "$OUT/$run"; rm -f "$OUT/$run/stack.log" "$OUT/$run/trace.jsonl" "$OUT/$run/fpm.jsonl"
     extra=()
     policy=kv
@@ -203,7 +206,7 @@ for s in "${!SPEC[@]}"; do
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" -e "GPUS=$IN_GPUS" -e "TP=$GPUS_PER_SLOT" \
         -e "EXTRA_VLLM_ARGS=$vllm_args" \
         -e "TOOL_PARSER=$TOOL_PARSER" -e "REASONING_PARSER=$REASONING_PARSER" -e ANTHROPIC_API=1 \
-        -e "PORT_OFFSET=$((100 * s))" \
+        -e "PORT_OFFSET=$((PORT_BASE + 100 * s))" \
         -e DYN_REQUEST_TRACE=1 -e DYN_REQUEST_TRACE_SINKS=jsonl \
         -e "DYN_REQUEST_TRACE_OUTPUT_PATH=/workspace/$OUT_REL/$run/trace.jsonl" \
         ${extra[@]+"${extra[@]}"} "$IMAGE" \
@@ -224,7 +227,7 @@ for s in "${!SPEC[@]}"; do
     run=${RUN[$s]}; [[ -z "$run" ]] && continue
     n=${SPEC[$s]##*:}; url="http://127.0.0.1:${PORT[$s]}"
     podman exec -d "${CID[$s]}" bash -c "python3 /workspace/benchmarks/agentic_taper/fpm_probe.py \
-        record --port $((20081 + 100 * s)) --out /workspace/$OUT_REL/$run/fpm.jsonl \
+        record --port $((20081 + PORT_BASE + 100 * s)) --out /workspace/$OUT_REL/$run/fpm.jsonl \
         > /workspace/$OUT_REL/$run/fpm_probe.log 2>&1"
     "$PY" "$REPO/benchmarks/agentic_taper/victim_client.py" --base-url "$url" --model "$MODEL" \
         --arm "$run" --out "$OUT/$run/victims.jsonl" --n-victims 100000 \
