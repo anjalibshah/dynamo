@@ -343,3 +343,19 @@ e1-e3b by `tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --sweep e3
 `cbsn0.9` replaces `cbs0.9` as the recommended setting if it passes A1-A5 and
 its interactive attainment is no more than 0.05 below `cbs0.9`'s. Reported
 either way: skip share and task p90 against `cbs0.9`.
+
+## e6: regulate only while interactive runs, at 28 agents (fixed 2026-10-19, before any e6 data)
+
+e4 preview (one pair): `cbs0.9` at 28 agents skipped 41% of agent request-steps
+(e3 at 24: 20%) and failed A3/A4. Its trace: 61% of steps had no interactive
+request and held 55% of skips (skip rate 44% vs 35% with one running), so
+`cbsn` would remove roughly half of the skipping at 28 agents.
+
+Runs: `e6 cbsn0.9:28`, `e6 kv:28`, `e6b cbsn0.9:28` (4 GPUs, after e5).
+Scored by `tradeoff_report.py --sweep e1 --sweep e4 --sweep e4b --sweep e6
+--sweep e6b --agents 28 --max-task-p90-ratio 1.20`. `cbsn0.9` is acceptable at
+28 agents if A1-A5 hold. Reported either way: skip share, task p90 and
+throughput against `cbs0.9` at 28, and each `cbsn0.9` run against the `kv` run
+of its own sweep. Outcome for the PR: acceptable at 24 (e5) and 28 (e6) makes
+`cbsn` the recommended setting for both loads; otherwise the PR states the load
+range where each setting holds.
