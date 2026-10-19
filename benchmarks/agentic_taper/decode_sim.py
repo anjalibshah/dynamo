@@ -70,6 +70,10 @@ target instead of the fixed tau_interactive):
                slack over max_tokens meets the deadline of any shorter reply
                too. M < 1 is a safety margin, e.g. slack1, slack0.9
   slackoM      the same with the true output length (simulation only)
+  slackM+P     the residual target with policy P's fill order, e.g.
+               slack0.9+pred0.5, slack0.9+oracle_blind (budget and order are
+               independent: the slack decides how much agent work fits a
+               step, the order decides which)
 
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
@@ -304,6 +308,10 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
              closed: bool = True, deadline: tuple = (500.0, 3.0, 6.16, 64)) -> dict:
     """deadline: (ttft_ms, factor, anchor_ms, interactive max_tokens) for slack*."""
     rng = random.Random(seed)
+    slack_spec = None
+    if policy.startswith("slack"):  # slackM[+base]: the residual target on a base policy
+        slack_spec, _, policy = policy.partition("+")
+        policy = policy or "class_blind"
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
     pol = None
@@ -313,15 +321,12 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
         pol = oracle_policy(eng, cfg, policy == "oracle")
     elif proxy:
         pol = score_policy(eng, cfg)
-    elif policy.startswith("slack"):
-        cfg.mode = "class_blind"
-        pol = eng.TaperPolicy(cfg)
     elif policy != "stock":
         cfg.mode = policy
         pol = eng.TaperPolicy(cfg)
-    slack_oracle = policy.startswith("slacko")
-    slack_m = (float(policy[len("slacko" if slack_oracle else "slack"):])
-               if policy.startswith("slack") else None)
+    slack_oracle = bool(slack_spec) and slack_spec.startswith("slacko")
+    slack_m = (float(slack_spec[len("slacko" if slack_oracle else "slack"):])
+               if slack_spec else None)
     dl_ttft, dl_factor, dl_anchor, dl_max = deadline
     waiting = {r.i: len(r.deps) for r in reqs} if closed else {}
     dependents = defaultdict(list)
