@@ -2,19 +2,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Decode Regulation
-subtitle: Keep interactive requests on deadline while coding agents load the same vLLM workers
+subtitle: Keep interactive requests on deadline while agentic workloads load the same vLLM workers
 ---
 
 > [!WARNING]
 > Decode regulation is experimental and available for vLLM workers only. The environment variables, defaults and metric names can change.
 
-Decode regulation is an opt-in vLLM scheduler policy. While coding agents and interactive users share a worker, it defers some agent decodes by one step at a time so that each step finishes fast enough for interactive requests to meet an end-to-end deadline. Deferred requests keep their KV cache and their place in the running batch. When the batch already fits the deadline, the policy does nothing.
+Decode regulation is an opt-in vLLM scheduler policy. While agentic workloads and interactive users share a worker, it defers some agent decodes by one step at a time so that each step finishes fast enough for interactive requests to meet an end-to-end deadline. Deferred requests keep their KV cache and their place in the running batch. When the batch already fits the deadline, the policy does nothing.
+
+Regulation is by priority, not by workload type: any traffic below the interactive priority is regulated the same way, whether it comes from agents, batch jobs or offline evaluation.
 
 The policy combines two published ideas: per-step admission of best-effort decodes against a step-time predictor ([HyGen](https://arxiv.org/abs/2501.14808)), and a target computed from each real-time request's remaining deadline ([BROS](https://arxiv.org/abs/2504.09590)).
 
 ## The Problem
 
-Coding agents keep many long-context sessions in the decode batch at once. Each decode step reads every running request's KV cache, so step time grows with the number of running requests and their total context. An interactive request that joins this batch gets its first token on time but then waits for every step:
+Agentic workloads, such as coding, research and browsing agents, keep many long-context sessions in the decode batch at once, and agent frameworks add subagents on top. Each decode step reads every running request's KV cache, so step time grows with the number of running requests and their total context. An interactive request that joins this batch gets its first token on time but then waits for every step:
 
 - In a 24-agent Claude Code workload on MiniMax-M2, 81–85% of interactive requests that missed a 3× unloaded inter-token-latency deadline had an on-time first token. Their inter-token latency was 30–35 ms against an 18.5 ms budget.
 - Request priority does not help. Router and engine priority order requests that are waiting; they do not change which running requests decode in a step. See [Priority Scheduling](priority-scheduling.md).
@@ -67,7 +69,7 @@ Interactive requests are identified by priority. Clients send `nvext.agent_hints
 }
 ```
 
-Agent traffic sends no priority, or a lower one. Set `max_tokens` on interactive requests: the deadline is computed from it.
+Agent and other background traffic sends no priority, or a lower one. Set `max_tokens` on interactive requests: the deadline is computed from it.
 
 Start each vLLM worker with regulation enabled. The deadline below allows 500 ms to the first token and 18.48 ms per output token after it:
 
@@ -81,7 +83,7 @@ python3 -m dynamo.vllm --model MiniMaxAI/MiniMax-M2 --tensor-parallel-size 4
 
 Setting `DYN_TAPER_ENGINE` selects Dynamo's `TaperScheduler`. Do not also pass a different `--scheduler-cls`; the worker refuses to start with both.
 
-Choose the deadline from the unloaded latency of the model on your hardware. A per-token budget of about 3× the unloaded inter-token latency leaves the agents room to decode; a budget close to the unloaded latency forces regulation on almost every step.
+Choose the deadline from the unloaded latency of the model on your hardware. A per-token budget of about 3× the unloaded inter-token latency leaves regulated requests room to decode; a budget close to the unloaded latency forces regulation on almost every step.
 
 ## Calibrate the Step-Time Model
 
@@ -166,11 +168,11 @@ The worker's `/metrics` endpoint exposes the same counts, labeled by `model` and
 | `dynamo_component_decode_regulation_enabled` | gauge | `1` while regulating, `0` after the fail-open guard trips. |
 | `dynamo_component_decode_regulation_step_time_bias` | gauge | Measured over predicted step time. |
 
-`skipped_total / regulated_total` is the share of agent decode work deferred. `engaged_steps_total / steps_total` is how often the worker ran over the target.
+`skipped_total / regulated_total` is the share of regulated decode work deferred. `engaged_steps_total / steps_total` is how often the worker ran over the target.
 
 ## Measured Effect
 
-MiniMax-M2 on 4 H200 GPUs (tensor parallelism 4, FP8 KV cache), 24 Claude Code agents on 64 SWE-bench Verified tasks, and one interactive request every 2 s on average with `max_tokens` 64. Deadline: 500 ms plus 18.48 ms per token after the first.
+Measured so far with coding agents only. MiniMax-M2 on 4 H200 GPUs (tensor parallelism 4, FP8 KV cache), 24 Claude Code agents on 64 SWE-bench Verified tasks, and one interactive request every 2 s on average with `max_tokens` 64. Deadline: 500 ms plus 18.48 ms per token after the first.
 
 | Configuration | Interactive requests on deadline | Agent tasks per hour | Agent task time, p90 |
 |---|---|---|---|
