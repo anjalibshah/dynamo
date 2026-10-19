@@ -37,6 +37,9 @@
 #   cbs<M>  cb with the deadline-aware target (DYN_TAPER_DEADLINE=ENGINE_DEADLINE,
 #           DYN_TAPER_SLACK_MARGIN=M): each interactive request's remaining
 #           end-to-end deadline over its remaining max_tokens (cbs0.9)
+#   cbsn<M> cbs<M> that regulates only while an interactive request is running
+#           (DYN_TAPER_TAU_AGENT_MS=1e9; by default agents are held to a
+#           21.63 ms target among themselves when no interactive request runs)
 # VICTIM_PRIORITY stamps nvext.agent_hints.priority on every interactive
 # request (set it for every arm of a comparison so request bodies match).
 # MOUNT_VLLM=1 mounts this checkout's components/src/dynamo/vllm over the
@@ -165,7 +168,7 @@ echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
     case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow|prio|cb) ;;
-        cbt[0-9]*|cbk[0-9]*|cbs[0-9]*) [[ "$arm" =~ ^cb(t[0-9]+(\.[0-9]+)?|k[1-9][0-9]*|s[0-9]+(\.[0-9]+)?)$ ]] \
+        cbt[0-9]*|cbk[0-9]*|cbs[0-9]*|cbsn[0-9]*) [[ "$arm" =~ ^cb(t[0-9]+(\.[0-9]+)?|k[1-9][0-9]*|sn?[0-9]+(\.[0-9]+)?)$ ]] \
             || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; } ;;
         *) echo "bad arm in ${SPEC[$s]}" >&2; exit 2 ;; esac
     if [[ ( "$arm" == taper || "$arm" == shadow ) && -z "$PRED_COEFFS" ]]; then
@@ -200,6 +203,8 @@ for s in "${!SPEC[@]}"; do
              case "$arm" in
                  cbt*) extra+=(-e "DYN_TAPER_TAU_INTERACTIVE_MS=$(python3 -c "print(round($ENGINE_TAU_MS * ${arm#cbt}, 3))")") ;;
                  cbk*) extra+=(-e "DYN_TAPER_K=${arm#cbk}") ;;
+                 cbsn*) extra+=(-e "DYN_TAPER_DEADLINE=$ENGINE_DEADLINE" -e "DYN_TAPER_SLACK_MARGIN=${arm#cbsn}"
+                                -e DYN_TAPER_TAU_AGENT_MS=1e9) ;;
                  cbs*) extra+=(-e "DYN_TAPER_DEADLINE=$ENGINE_DEADLINE" -e "DYN_TAPER_SLACK_MARGIN=${arm#cbs}") ;;
              esac ;;
     esac

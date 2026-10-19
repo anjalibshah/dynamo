@@ -317,3 +317,29 @@ done
 python3 tradeoff_report.py --sweep e1 --sweep e4 --sweep e4b \
     --suite=-mm --n-tasks 64 --root $REPO/harbor_ab-mm --agents 28 --max-task-p90-ratio 1.20
 ```
+
+## Agent-only regulation (e5, conditional)
+
+With `DYN_TAPER_DEADLINE` set, the step target is the tightest interactive
+budget while an interactive request is running, and `DYN_TAPER_TAU_AGENT_MS`
+(21.63 ms) while none is. So agents are also regulated among themselves in
+steps where no interactive request can benefit, and a fresh interactive
+request's budget (about 24 ms at margin 0.9, max_tokens 64) is looser than
+that agent target. `cbsn<M>` sets `DYN_TAPER_TAU_AGENT_MS=1e9`: regulation
+only while an interactive request runs.
+
+### Gate: measure the opportunity in the e3 traces first
+
+Each `cb*` run writes `taper_engine.jsonl` (one record per step, with the step
+target `tau`). Steps with `tau == 21.63` in a `cbs` run had no interactive
+request. Run e5 only if those steps hold at least 25% of all skips in
+`swe3-cbs0.9-n24` and `swe3b-cbs0.9-n24`.
+
+### Arms and rule (fixed 2026-10-19, before any e5 data)
+
+24 agents, 4 GPUs: `e5 cbsn0.9:24`, `e5 kv:24`, `e5b cbsn0.9:24`. Scored with
+e1-e3b by `tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --sweep e3
+--sweep e3b --sweep e5 --sweep e5b --agents 24 --max-task-p90-ratio 1.20`.
+`cbsn0.9` replaces `cbs0.9` as the recommended setting if it passes A1-A5 and
+its interactive attainment is no more than 0.05 below `cbs0.9`'s. Reported
+either way: skip share and task p90 against `cbs0.9`.
