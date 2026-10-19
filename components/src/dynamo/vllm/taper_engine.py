@@ -366,9 +366,10 @@ class TaperPolicy:
         d.n_managed = len(managed)
         d.n_interactive = len(cands) - len(managed)
         by_task: dict = {}
-        for c in managed:
-            by_task.setdefault(c.task, []).append(c)
-        self._track_widths(by_task)
+        if self.cfg.mode == "role_aware":
+            for c in managed:
+                by_task.setdefault(c.task, []).append(c)
+            self._track_widths(by_task)
         d.tau_ms = (
             self.cfg.tau_interactive_ms
             if len(managed) < len(cands)
@@ -420,11 +421,14 @@ class TaperPolicy:
             (c for c in managed if c.req_id not in base_ids),
             key=lambda c: self._fill_key(c, straggler_tasks),
         )
+        # predict(n + 1, ctx + c.ctx) + extra <= limit, unrolled: this loop
+        # runs once per regulated request per step
+        a, b, cc = self.cfg.coeffs
+        bias, max_opp = self.bias, self.cfg.max_opp_ctx
         for c in order:
-            guard_ok = (
-                not self.cfg.max_opp_ctx or opp_ctx + c.ctx <= self.cfg.max_opp_ctx
-            )
-            if guard_ok and self.predict(n + 1, ctx + c.ctx) + extra <= limit:
+            guard_ok = not max_opp or opp_ctx + c.ctx <= max_opp
+            t = bias * max(0.0, a + b * (n + 1) + cc * (ctx + c.ctx)) + extra
+            if guard_ok and t <= limit:
                 n, ctx, opp_ctx = n + 1, ctx + c.ctx, opp_ctx + c.ctx
                 d.n_opp += 1
             else:
@@ -446,6 +450,61 @@ class TaperPolicy:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _Static:
+    """What a request's ``Cand`` needs that does not change between steps."""
+
+    interactive: bool = True
+    task: Optional[str] = None
+    role: str = ""
+    max_tokens: int = 0  # 0: no deadline-aware target
+    arrival_ms: float = 0.0
+
+
+def _static_from_request(req: Any, cfg: Optional[TaperConfig]) -> _Static:
+    sp = getattr(req, "sampling_params", None)
+    extra = getattr(sp, "extra_args", None) if sp is not None else None
+    ident = extra.get(EXTRA_ARGS_KEY) if isinstance(extra, dict) else None
+    if isinstance(ident, dict) and not ident.get("interactive", True):
+        # a regulated request without agent context is a task of its own
+        return _Static(
+            interactive=False,
+            task=str(ident.get("task") or req.request_id),
+            role=str(ident.get("role", "")),
+        )
+    st = _Static()
+    if cfg is not None and cfg.deadline is not None:
+        max_tokens = getattr(sp, "max_tokens", None) if sp is not None else None
+        arrival = getattr(req, "arrival_time", None)
+        if max_tokens and arrival is not None:
+            st.max_tokens, st.arrival_ms = int(max_tokens), arrival * 1e3
+    return st
+
+
+def _cand(
+    req: Any, st: _Static, cfg: Optional[TaperConfig], now_ms: float
+) -> Optional[Cand]:
+    if (
+        getattr(req, "is_prefill_chunk", False)
+        or req.num_computed_tokens < req.num_prompt_tokens
+    ):
+        return None
+    c = Cand(
+        req.request_id,
+        req.num_computed_tokens,
+        st.interactive,
+        st.task,
+        st.role,
+        req.num_output_tokens,
+    )
+    if st.max_tokens and cfg is not None and cfg.deadline is not None:
+        ttft_ms, per_token_ms = cfg.deadline
+        n = max(st.max_tokens, req.num_output_tokens + 1)
+        due_ms = st.arrival_ms + ttft_ms + per_token_ms * n
+        c.tau_ms = cfg.slack_margin * (due_ms - now_ms) / (n - req.num_output_tokens)
+    return c
+
+
 def cand_from_request(
     req: Any, cfg: Optional[TaperConfig] = None, now: Optional[float] = None
 ) -> Optional[Cand]:
@@ -454,37 +513,8 @@ def cand_from_request(
     With ``cfg.deadline`` set, an interactive request also gets ``tau_ms``: the
     per-token time it can still afford against its end-to-end deadline, taken
     at ``max_tokens`` (``now``: wall-clock seconds, as ``req.arrival_time``)."""
-    if (
-        getattr(req, "is_prefill_chunk", False)
-        or req.num_computed_tokens < req.num_prompt_tokens
-    ):
-        return None
-    sp = getattr(req, "sampling_params", None)
-    extra = getattr(sp, "extra_args", None) if sp is not None else None
-    ident = extra.get(EXTRA_ARGS_KEY) if isinstance(extra, dict) else None
-    c = Cand(
-        req_id=req.request_id,
-        ctx=req.num_computed_tokens,
-        decoded=req.num_output_tokens,
-    )
-    if isinstance(ident, dict) and not ident.get("interactive", True):
-        # a regulated request without agent context is a task of its own
-        c.interactive, c.task, c.role = (
-            False,
-            str(ident.get("task") or req.request_id),
-            str(ident.get("role", "")),
-        )
-    elif cfg is not None and cfg.deadline is not None:
-        max_tokens = getattr(sp, "max_tokens", None) if sp is not None else None
-        arrival = getattr(req, "arrival_time", None)
-        if max_tokens and arrival is not None:
-            ttft_ms, per_token_ms = cfg.deadline
-            n = max(int(max_tokens), req.num_output_tokens + 1)
-            due_ms = arrival * 1e3 + ttft_ms + per_token_ms * n
-            now_ms = (time.time() if now is None else now) * 1e3
-            left = n - req.num_output_tokens
-            c.tau_ms = cfg.slack_margin * (due_ms - now_ms) / left
-    return c
+    now_ms = (time.time() if now is None else now) * 1e3
+    return _cand(req, _static_from_request(req, cfg), cfg, now_ms)
 
 
 class TaperSkipMixin:
@@ -522,6 +552,7 @@ class TaperSkipMixin:
             else None
         )
         self._taper_stats = _Stats()
+        self._taper_static: dict = {}  # request id -> _Static
         self._taper_pinned = 0  # consecutive decode-only steps with bias at a clamp
         self._taper_next_log = time.monotonic() + self._taper_cfg.log_s
         if self._taper_cfg.enabled:
@@ -545,12 +576,20 @@ class TaperSkipMixin:
         t_start = time.perf_counter()
         by_id = {}
         cands = []
-        now = time.time()
+        cfg, static = self._taper_cfg, self._taper_static
+        now_ms = time.time() * 1e3
         for req in self.running:
-            c = cand_from_request(req, self._taper_cfg, now)
+            st = static.get(req.request_id)
+            if st is None:
+                st = static[req.request_id] = _static_from_request(req, cfg)
+            c = _cand(req, st, cfg, now_ms)
             if c is not None:
                 cands.append(c)
                 by_id[c.req_id] = req
+        if len(static) > 2 * len(self.running) + 64:
+            live = {req.request_id for req in self.running}
+            for rid in [r for r in static if r not in live]:
+                del static[rid]
         d = self._taper.decide(cands, self._taper_prefill_estimate())
         if d.skip:
             # schedule() increments current_step first, so this skips exactly one step.

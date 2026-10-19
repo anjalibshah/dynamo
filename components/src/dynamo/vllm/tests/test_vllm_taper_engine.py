@@ -472,3 +472,18 @@ def test_prefill_in_the_step_reduces_opportunistic_decodes():
     without = TaperPolicy(cfg()).decide(cands()).n_opp
     p = TaperPolicy(cfg(prefill_coeffs=(1.0, 0.0005)))
     assert p.decide(cands(), prefill_tokens=8192).n_opp < without
+
+
+def test_identity_cache_follows_running_set():
+    reqs = overloaded()
+    s = Sched(reqs, cfg("class_blind"))
+    step(s)
+    assert set(s._taper_static) == {r.request_id for r in reqs}
+    # identity is read once: a later change to extra_args is not seen
+    reqs[1].sampling_params.extra_args = None
+    assert s._taper_static["main"].interactive is False
+    for k in range(10):  # finished requests are dropped, in batches
+        s.running = [FakeRequest(f"n{k}-{i}", 1_000) for i in range(20)]
+        step(s)
+        assert len(s._taper_static) <= 2 * 20 + 64 + 20
+    assert "main" not in s._taper_static
