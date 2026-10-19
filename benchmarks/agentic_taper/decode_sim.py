@@ -56,6 +56,10 @@ protection), to see how much of oracle_blind's gain an engine could capture:
   predX        a learned predictor called once per session, at its start: the
                session's total decode work times exp(N(0, X)), minus what the
                session has been served since (floored at 0), e.g. pred0.5
+  oslX         Dynamo's per-request hint (nvext.agent_hints.osl): this request's
+               output length times exp(N(0, X)), drawn once per request, minus
+               the tokens it has generated (floored at 0). Request scope only:
+               no knowledge of the session's later requests, e.g. osl0.5
   noisyX       oracle_blind's remaining work times exp(N(0, X)), drawn once per
                request. An upper bound, not a predictor: the estimate still
                shrinks exactly as the work is done (use predX for a predictor)
@@ -316,7 +320,7 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
     q, p = cfg.prefill_coeffs
     pol = None
     proxy = (policy in ("las", "las_task", "mas", "mas_task", "ctx")
-             or policy.startswith(("noisy", "pred")))
+             or policy.startswith(("noisy", "pred", "osl")))
     if policy in ("oracle", "oracle_blind"):
         pol = oracle_policy(eng, cfg, policy == "oracle")
     elif proxy:
@@ -342,8 +346,8 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
     att_session: dict = defaultdict(int)  # decode tokens served, per session / task
     att_task: dict = defaultdict(int)
     err = {}
-    if policy.startswith("noisy"):
-        sigma = float(policy[len("noisy"):])
+    if policy.startswith(("noisy", "osl")):
+        sigma = float(policy[len("noisy" if policy.startswith("noisy") else "osl"):])
         erng = random.Random(seed + 1)
         err = {r.i: math.exp(erng.gauss(0.0, sigma)) for r in reqs}
     if policy.startswith("pred"):
@@ -399,6 +403,9 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
                     pol.score = {i: -att_task[reqs[i].task] for i in active}
                 elif policy == "ctx":
                     pol.score = {i: ctx[i] for i in active}
+                elif policy.startswith("osl"):
+                    pol.score = {i: max(0.0, reqs[i].need * err[i] - (reqs[i].need - left[i]))
+                                 for i in active}
                 elif policy.startswith("pred"):
                     pol.score = {i: max(0.0, err[reqs[i].session] - att_session[reqs[i].session])
                                  for i in active}
