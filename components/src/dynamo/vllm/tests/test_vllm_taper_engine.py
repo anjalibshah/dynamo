@@ -487,3 +487,11 @@ def test_identity_cache_follows_running_set():
         step(s)
         assert len(s._taper_static) <= 2 * 20 + 64 + 20
     assert "main" not in s._taper_static
+
+
+def test_observe_mode_decides_but_never_skips():
+    reqs = overloaded()
+    s = Sched(reqs, cfg("observe"))
+    assert step(s) == {r.request_id for r in reqs}
+    line = s._taper_stats.summary_and_reset(1.0)
+    assert "engaged=1 skipped=4 " in line  # what class_blind would have skipped

@@ -44,7 +44,10 @@ against a fake scheduler; ``taper_scheduler.TaperScheduler`` binds the mixin to
 Dynamo's ``InstrumentedScheduler``.
 
 Environment:
-  DYN_TAPER_ENGINE            off | class_blind | role_aware (default off)
+  DYN_TAPER_ENGINE            off | observe | class_blind | role_aware (default off);
+                              observe decides as class_blind but never skips: the
+                              summary, metrics and trace show what regulation would
+                              do, and the trace calibrates DYN_TAPER_COEFFS
   DYN_TAPER_COEFFS            a,b,c of T(n, L) = a + b*n + c*L ms (fit_step_model.py)
   DYN_TAPER_PREFILL_COEFFS    q,p: a step with P > 0 prefill tokens adds q + p*P ms
                               (default 0,0: prefill ignored)
@@ -83,7 +86,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
-MODES = ("off", "class_blind", "role_aware")
+MODES = ("off", "observe", "class_blind", "role_aware")
 EXTRA_ARGS_KEY = "dynamo_taper"
 # Prometheus family (dynamo.prometheus_names.name_prefix.COMPONENT + suffix),
 # written from the EngineCore process through PROMETHEUS_MULTIPROC_DIR and
@@ -591,7 +594,7 @@ class TaperSkipMixin:
             for rid in [r for r in static if r not in live]:
                 del static[rid]
         d = self._taper.decide(cands, self._taper_prefill_estimate())
-        if d.skip:
+        if d.skip and self._taper_cfg.mode != "observe":
             # schedule() increments current_step first, so this skips exactly one step.
             nxt = self.current_step + 2
             for rid in d.skip:

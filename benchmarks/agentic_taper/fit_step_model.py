@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fit the taper gate's step-time model T = a + b*n + c*L from fpm_probe.py records.
+"""Fit the step-time model T = a + b*n + c*L for decode regulation (DYN_TAPER_COEFFS).
+
+Input: per-step records from either fpm_probe.py or the scheduler's own trace
+(DYN_TAPER_TRACE, written in any non-off mode; DYN_TAPER_ENGINE=observe records
+a stock-scheduled run without skipping anything).
 
 PACE's predictor (taper_router/pace_predictor.py): OLS on decode-only steps,
 n = decode requests in the step, L = their total KV context (tokens), T in ms.
@@ -32,6 +36,9 @@ def load(path: str, skip_first_s: float, max_ms: float) -> list[tuple[float, flo
                 r = json.loads(line)
             except json.JSONDecodeError:  # torn last line of a live recording
                 continue
+            if "actual" in r:  # DYN_TAPER_TRACE record
+                r = {"t": r["t"], "n_prefill": 0 if r["decode_only"] else 1,
+                     "n_decode": r["n"], "decode_kv_tok": r["ctx"], "wall_ms": r["actual"]}
             t0 = r["t"] if t0 is None else t0
             if r["t"] - t0 < skip_first_s or r["n_prefill"] or r["n_decode"] < 1:
                 continue
@@ -90,7 +97,7 @@ def r2(c, rows) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="+", help="fpm.jsonl files (one per run)")
+    ap.add_argument("paths", nargs="+", help="fpm.jsonl or DYN_TAPER_TRACE files (one per run)")
     ap.add_argument("--skip-first-s", type=float, default=60.0, help="warm-up to drop per run")
     ap.add_argument("--max-ms", type=float, default=100.0, help="drop steps slower than this")
     ap.add_argument("--json", help="also write {a, b, c, ...} here")
@@ -141,6 +148,7 @@ def main() -> None:
                   f"MAPE={mape(c, rs):.1%}  bias={bias:+.2f} ms")
 
     print(f"\nPRED_COEFFS={c[0]:.4f},{c[1]:.6f},{c[2]:.9f}")
+    print(f"DYN_TAPER_COEFFS={c[0]:.4f},{c[1]:.6f},{c[2]:.9f}")
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"a": c[0], "b": c[1], "c": c[2], "steps": len(allrows),
