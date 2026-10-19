@@ -270,3 +270,50 @@ python3 tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --sweep e3 --sweep 
   keep the feature experimental.
 - **No better than cb on GPU:** the simulator's gain does not transfer; stop
   the scheduler PR, ship the benchmark PR.
+
+### e3 result (2026-10-19)
+
+`cbs0.9` acceptable: interactive 0.931 (2 runs) vs kv 0.31 (5 runs), task p90 /
+kv 0.94, throughput / kv 0.94, skip share 20% (cb: 1.39, 0.77, 35%). Against
+the four kv runs before e3b only: 1.01 and 0.91. Secondary: task p90 / cb 0.67
+(simulator: 0.93). Full table in NEXT_STEPS.md 7.3s.
+
+## Heavier load (e4): does the deadline budget hold at 28 agents?
+
+e3 tested one load. The budget's slack shrinks as load grows (each step is
+slower, so less of every interactive request's deadline is left to spend), so
+both the agents' cost and the interactive attainment can change with load. e1
+at 28 agents is the reference: there class-blind cost less than at 24
+(throughput 0.95, task p90 1.24x).
+
+### Arms (28 agents, 4 GPUs, one at a time; same code as e3)
+
+`kv` and `cbs0.9`, two runs each, in ABBA order so each `cbs0.9` run has a
+`kv` run next to it.
+
+### Rule (fixed 2026-10-19, before any e4 data)
+
+Scored by `tradeoff_report.py --sweep e1 --sweep e4 --sweep e4b --agents 28
+--max-task-p90-ratio 1.20` (6.16 ms anchor; kv = e1's and e4's kv runs at 28;
+prio from e1). Same A1-A5 as e3. Reported either way: each `cbs0.9` run
+against the `kv` run of the same sweep, and against e1's `cb` at 28.
+
+### What each outcome means (none of them stops the default-off PR)
+
+- **Acceptable:** the PR claims the result at 24 and 28 agents.
+- **Fails A3 or A4 but costs less than e1's cb at 28:** the PR states that the
+  agent cost grows with overload, with both numbers.
+- **Fails A1 (interactive < 0.80):** the budget runs out under heavier load;
+  the PR states the load range where it holds, and the margin is the knob to
+  revisit.
+
+### Run
+
+```bash
+export N_TASKS=64 PORT_BASE=200   # plus PY, GPUS_PER_SLOT=4, VICTIM_PRIORITY=1, MOUNT_VLLM=1, GPU_IDS
+for r in "e4 kv:28" "e4 cbs0.9:28" "e4b cbs0.9:28" "e4b kv:28"; do
+  ( set -o pipefail; ./sweep_parallel.sh ${r%% *} "${r#* }" 2>&1 | tee -a /scratch/$USER/engine_ab.log ) || break
+done
+python3 tradeoff_report.py --sweep e1 --sweep e4 --sweep e4b \
+    --suite=-mm --n-tasks 64 --root $REPO/harbor_ab-mm --agents 28 --max-task-p90-ratio 1.20
+```
