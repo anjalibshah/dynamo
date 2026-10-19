@@ -191,6 +191,24 @@ def test_class_blind_may_skip_the_main_session():
     assert "chat" not in skipped
 
 
+def test_residual_target_sets_the_step_budget():
+    p = TaperPolicy(cfg("class_blind"))
+    fixed = p.decide(cands(n_subs=12))
+    loose = cands(n_subs=12)
+    tight = cands(n_subs=12)
+    for c in loose:
+        if c.interactive:
+            c.tau_ms = 2 * p.cfg.tau_interactive_ms
+    for c in tight:
+        if c.interactive:
+            c.tau_ms = 0.0  # already late: nothing opportunistic
+    d_loose = TaperPolicy(cfg("class_blind")).decide(loose)
+    d_tight = TaperPolicy(cfg("class_blind")).decide(tight)
+    assert d_loose.tau_ms == 2 * p.cfg.tau_interactive_ms
+    assert len(d_loose.skip) < len(fixed.skip) < len(d_tight.skip)
+    assert d_tight.n_opp == 0
+
+
 def test_role_aware_never_skips_main_session():
     p = TaperPolicy(cfg())
     for _ in range(20):

@@ -60,6 +60,17 @@ protection), to see how much of oracle_blind's gain an engine could capture:
                request. An upper bound, not a predictor: the estimate still
                shrinks exactly as the work is done (use predX for a predictor)
 
+Deadline-aware budget (BROS-style residual time; class_blind with a per-step
+target instead of the fixed tau_interactive):
+
+  slackM       each interactive request's target is M x (its end-to-end deadline
+               - now) / its remaining tokens, its deadline and tokens taken at
+               --interactive-max-tokens (all a runtime knows: arrival time and
+               max_tokens); the step target is the tightest. Spreading the
+               slack over max_tokens meets the deadline of any shorter reply
+               too. M < 1 is a safety margin, e.g. slack1, slack0.9
+  slackoM      the same with the true output length (simulation only)
+
 Scoring uses the T80 window (start .. the ceil(0.8 * tasks)-th task completion)
 of each simulation, as sweep_report.py does for real runs. The fidelity line
 compares the stock simulation with the recording in its own T80 window; do not
@@ -290,7 +301,8 @@ def score_policy(eng, cfg):
 
 
 def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, seed: int,
-             closed: bool = True) -> dict:
+             closed: bool = True, deadline: tuple = (500.0, 3.0, 6.16, 64)) -> dict:
+    """deadline: (ttft_ms, factor, anchor_ms, interactive max_tokens) for slack*."""
     rng = random.Random(seed)
     a, b, c = cfg.coeffs
     q, p = cfg.prefill_coeffs
@@ -301,9 +313,16 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
         pol = oracle_policy(eng, cfg, policy == "oracle")
     elif proxy:
         pol = score_policy(eng, cfg)
+    elif policy.startswith("slack"):
+        cfg.mode = "class_blind"
+        pol = eng.TaperPolicy(cfg)
     elif policy != "stock":
         cfg.mode = policy
         pol = eng.TaperPolicy(cfg)
+    slack_oracle = policy.startswith("slacko")
+    slack_m = (float(policy[len("slacko" if slack_oracle else "slack"):])
+               if policy.startswith("slack") else None)
+    dl_ttft, dl_factor, dl_anchor, dl_max = deadline
     waiting = {r.i: len(r.deps) for r in reqs} if closed else {}
     dependents = defaultdict(list)
     if closed:
@@ -357,6 +376,13 @@ def simulate(reqs: list[Req], policy: str, eng, cfg, budget: int, noise: float, 
             cands = [eng.Cand(req_id=r.i, ctx=ctx[r.i], interactive=r.interactive,
                               task=r.task, role=r.role, decoded=r.need - left[r.i] + 1)
                      for r in active.values()]
+            if slack_m is not None:
+                for cd in cands:
+                    if cd.interactive:
+                        r = reqs[cd.req_id]
+                        nt = r.need if slack_oracle else max(r.need, dl_max)
+                        due = arrive[r.i] + dl_ttft + dl_factor * dl_anchor * nt
+                        cd.tau_ms = slack_m * (due - t) / max(1, nt - (r.need - left[r.i]))
             if proxy:
                 if policy == "las":
                     pol.score = {i: att_session[reqs[i].session] for i in active}
@@ -571,6 +597,8 @@ def main() -> None:
     ap.add_argument("--factor", type=float, default=3.0)
     ap.add_argument("--anchor-ms", type=float, default=6.16)
     ap.add_argument("--ttft-ms", type=float, default=500.0)
+    ap.add_argument("--interactive-max-tokens", type=int, default=64,
+                    help="max_tokens of the interactive requests (victim_client default)")
     ap.add_argument("--engine", default=ENGINE, help="path to taper_engine.py")
     ap.add_argument("--json", help="also write all scores here")
     a = ap.parse_args()
@@ -635,7 +663,8 @@ def main() -> None:
         for pol in policies:
             for rho in rhos:
                 cfg.rho = rho
-                sim = simulate(reqs, pol, eng, cfg, budget, a.noise, a.seed, closed)
+                sim = simulate(reqs, pol, eng, cfg, budget, a.noise, a.seed, closed,
+                               (a.ttft_ms, a.factor, a.anchor_ms, a.interactive_max_tokens))
                 rows[(pol, rho)] = score(reqs, sim, stock, a.factor, a.anchor_ms, a.ttft_ms)
         for (pol, rho), s in rows.items():
             label = pol if pol == "stock" else f"{pol[:12]} {rho:g}"

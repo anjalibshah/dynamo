@@ -234,6 +234,10 @@ class Cand:
     role: str = ""
     decoded: int = 0
     skip_run: int = 0
+    # Per-token time this request can still afford (ms): its remaining deadline
+    # over its remaining tokens (BROS-style residual budget). None: the fixed
+    # class target applies.
+    tau_ms: Optional[float] = None
 
 
 @dataclass
@@ -353,6 +357,13 @@ class TaperPolicy:
             if len(managed) < len(cands)
             else self.cfg.tau_agent_ms
         )
+        residual = [
+            c.tau_ms
+            for c in cands
+            if (c.interactive or c.task is None) and c.tau_ms is not None
+        ]
+        if residual:
+            d.tau_ms = min(residual)
         extra = self.predict_prefill(prefill_tokens)
         d.pred_all_ms = self.predict(len(cands), sum(c.ctx for c in cands)) + extra
         if d.pred_all_ms <= d.tau_ms or not managed:
