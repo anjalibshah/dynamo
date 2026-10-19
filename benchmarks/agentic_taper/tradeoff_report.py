@@ -41,7 +41,7 @@ from collections import defaultdict
 from engine_ab_report import engine_health, score
 from sweep_report import score_run
 
-ARM = re.compile(r"sw.+?-(kv|prio|cb|cbt[\d.]+|cbk\d+)-n(\d+)$")
+ARM = re.compile(r"sw.+?-(kv|prio|cb|cbt[\d.]+|cbk\d+|cbs[\d.]+)-n(\d+)$")
 
 
 def target_mult(arm: str) -> float:

@@ -34,6 +34,9 @@
 #           (cbt1.5, cbt2: a looser target, so fewer agent decodes skipped)
 #   cbk<K>  cb with DYN_TAPER_K=K: every request decodes at least once every
 #           K steps (cbk2: at most one skipped step in a row; default K is 4)
+#   cbs<M>  cb with the deadline-aware target (DYN_TAPER_DEADLINE=ENGINE_DEADLINE,
+#           DYN_TAPER_SLACK_MARGIN=M): each interactive request's remaining
+#           end-to-end deadline over its remaining max_tokens (cbs0.9)
 # VICTIM_PRIORITY stamps nvext.agent_hints.priority on every interactive
 # request (set it for every arm of a comparison so request bodies match).
 # MOUNT_VLLM=1 mounts this checkout's components/src/dynamo/vllm over the
@@ -79,6 +82,9 @@ ENGINE_PREFILL_COEFFS="${ENGINE_PREFILL_COEFFS:-17.5,0.035}"
 # Interactive per-token target of the cb arms in ms (TaperConfig default); the
 # cbt<m> arms multiply it.
 ENGINE_TAU_MS="${ENGINE_TAU_MS:-18.48}"
+# Interactive end-to-end deadline for the cbs<M> arms: "ttft_ms,per_token_ms"
+# (500 ms + 3 x MiniMax-M2's 6.16 ms unloaded ITL per token).
+ENGINE_DEADLINE="${ENGINE_DEADLINE:-500,18.48}"
 AGENT="${AGENT:-claude-code}"
 OC_VERSION="${OC_VERSION:-1.19.0}"     # 1.19.0 sends each subagent's own x-session-id
 OMO_VERSION="${OMO_VERSION:-5.1.32}"
@@ -159,7 +165,7 @@ echo "=== sweep $TAG ($(date -u +%H:%M:%S)): $SPECS  [instruction: ${INSTRUCTION
 for s in "${!SPEC[@]}"; do
     arm=${SPEC[$s]%%:*}; n=${SPEC[$s]##*:}
     case "$arm" in kv|ctx|eager|pass|cap1|cap2|taper|shadow|prio|cb) ;;
-        cbt[0-9]*|cbk[0-9]*) [[ "$arm" =~ ^cb(t[0-9]+(\.[0-9]+)?|k[1-9][0-9]*)$ ]] \
+        cbt[0-9]*|cbk[0-9]*|cbs[0-9]*) [[ "$arm" =~ ^cb(t[0-9]+(\.[0-9]+)?|k[1-9][0-9]*|s[0-9]+(\.[0-9]+)?)$ ]] \
             || { echo "bad arm in ${SPEC[$s]}" >&2; exit 2; } ;;
         *) echo "bad arm in ${SPEC[$s]}" >&2; exit 2 ;; esac
     if [[ ( "$arm" == taper || "$arm" == shadow ) && -z "$PRED_COEFFS" ]]; then
@@ -194,6 +200,7 @@ for s in "${!SPEC[@]}"; do
              case "$arm" in
                  cbt*) extra+=(-e "DYN_TAPER_TAU_INTERACTIVE_MS=$(python3 -c "print(round($ENGINE_TAU_MS * ${arm#cbt}, 3))")") ;;
                  cbk*) extra+=(-e "DYN_TAPER_K=${arm#cbk}") ;;
+                 cbs*) extra+=(-e "DYN_TAPER_DEADLINE=$ENGINE_DEADLINE" -e "DYN_TAPER_SLACK_MARGIN=${arm#cbs}") ;;
              esac ;;
     esac
     (( MOUNT_VLLM )) && extra+=(-v "$REPO/components/src/dynamo/vllm:$SITE_VLLM")
@@ -272,7 +279,7 @@ for s in "${!SPEC[@]}"; do
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" defers=$(grep -c 'taper.defer' <<<"$log" || true) forced=$(grep -c 'taper.forced_admit' <<<"$log" || true)"
     fi
-    if [[ "$run" == *-cb-* || "$run" == *-cbt*-* || "$run" == *-cbk*-* ]]; then
+    if [[ "$run" == *-cb-* || "$run" == *-cbt*-* || "$run" == *-cbk*-* || "$run" == *-cbs*-* ]]; then
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" engine: $(grep -o 'taper.engine steps=.*' <<<"$log" | tail -1 || true)"
         grep -q 'taper.engine disabled' <<<"$log" && gate+=" [DISABLED: $(grep -m1 -o 'taper.engine disabled.*' <<<"$log")]"

@@ -217,3 +217,56 @@ python3 tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --suite=-mm --n-tas
 - **None:** at 24 agents no tested setting buys interactive latency at an
   acceptable cost; report the curve and the 28-agent pass, and keep the
   feature as an experimental opt-in or stop there.
+
+## Deadline-aware target (e3)
+
+e2 found no acceptable operating point: a looser fixed target lets existing
+priority meet it too, and the tight one costs task p90 1.3-1.6x. The
+simulator (`decode_sim.py`, s1/s2, 4 runs) then tested BROS's residual-time
+budget: each interactive request's target is its remaining end-to-end
+deadline over its remaining `max_tokens`, times a margin. `slack0.9` cut task
+p90 to 0.93x class-blind (0.90-0.98) at 80-90% interactive, unchanged under
+10% step-time noise, with T80 1.06x stock vs 1.10x. Dynamo's per-request
+`osl` hint as a fill order added nothing (0.92-0.95); a session-level
+predictor would (0.83) but none exists at runtime. e3 tests `slack0.9` on GPU.
+It is a new experiment; e1 and e2 verdicts stand.
+
+### Arms (24 agents, 4 GPUs, one at a time; same image and backend code)
+
+`cbs0.9` = `cb` plus `DYN_TAPER_DEADLINE=500,18.48`, `DYN_TAPER_SLACK_MARGIN=0.9`.
+Two `cbs0.9` runs, plus one more `kv` and `cb` each so the pooled baselines
+include this session.
+
+### Rule (fixed 2026-10-19, before any e3 data)
+
+Scored by `tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --sweep e3 --sweep e3b
+--max-task-p90-ratio 1.20` (6.16 ms anchor; means over each arm's runs; kv = all
+five kv runs). `cbs0.9` is an acceptable operating point if A1 (interactive
+>= 0.80), A2 (minus prio >= 0.30), A3 (**task p90 / kv <= 1.20**), A4
+(throughput / kv >= 0.90) and A5 (engine health) hold. Secondary, reported
+either way: `cbs0.9` task p90 / `cb` task p90 (the simulator predicts about 0.93).
+
+A4 caveat recorded in advance: kv throughput spans 208-252 tasks/h across
+three identical runs, so A4 with two runs per arm is weak evidence; A3 is the
+primary cost criterion.
+
+### Run
+
+```bash
+export N_TASKS=64 PORT_BASE=200   # plus PY, GPUS_PER_SLOT=4, VICTIM_PRIORITY=1, MOUNT_VLLM=1, GPU_IDS
+for r in "e3 kv:24" "e3 cbs0.9:24" "e3 cb:24" "e3b cbs0.9:24" "e3b kv:24"; do
+  ( set -o pipefail; ./sweep_parallel.sh ${r%% *} "${r#* }" 2>&1 | tee -a /scratch/$USER/engine_ab.log ) || break
+done
+python3 tradeoff_report.py --sweep e1 --sweep e2 --sweep e2b --sweep e3 --sweep e3b \
+    --suite=-mm --n-tasks 64 --root $REPO/harbor_ab-mm --agents 24 --max-task-p90-ratio 1.20
+```
+
+### What each outcome means
+
+- **cbs0.9 acceptable:** the scheduler PR (default off, deadline-aware target)
+  with these numbers; the DEP proposes it.
+- **Not acceptable, but task p90 clearly below cb's:** an improvement over
+  HyGen-style regulation that still costs too much at 24 agents; report it and
+  keep the feature experimental.
+- **No better than cb on GPU:** the simulator's gain does not transfer; stop
+  the scheduler PR, ship the benchmark PR.

@@ -59,6 +59,13 @@ Environment:
   DYN_TAPER_FAILSAFE_STEPS    fail open (stock vLLM scheduling) after this many
                               consecutive decode-only steps with the step-time
                               bias pinned at its 0.5 / 2.0 clamp (0 = never)
+  DYN_TAPER_DEADLINE          ttft_ms,per_token_ms: interactive requests get a
+                              deadline-aware target (BROS-style residual budget):
+                              margin x (arrival + ttft_ms + per_token_ms x
+                              max_tokens - now) / (max_tokens - generated). The
+                              step target is the tightest; unset: the fixed
+                              DYN_TAPER_TAU_INTERACTIVE_MS
+  DYN_TAPER_SLACK_MARGIN      the margin above (default 0.9)
   DYN_TAPER_TRACE             JSONL path for per-step records (offline replay)
   DYN_TAPER_LOG_S             seconds between summary log lines
 """
@@ -99,6 +106,8 @@ class TaperConfig:
     interactive_prefix: str = "victim-"
     priority_min: Optional[int] = None
     failsafe_steps: int = 200
+    deadline: Optional[tuple] = None  # (ttft_ms, per_token_ms)
+    slack_margin: float = 0.9
     trace_path: str = ""
     log_s: float = 10.0
 
@@ -141,6 +150,14 @@ class TaperConfig:
         if env.get("DYN_TAPER_PRIORITY_MIN", "").strip():
             c.priority_min = int(env["DYN_TAPER_PRIORITY_MIN"])
         c.failsafe_steps = int(env.get("DYN_TAPER_FAILSAFE_STEPS", c.failsafe_steps))
+        if env.get("DYN_TAPER_DEADLINE", "").strip():
+            parts = [float(x) for x in env["DYN_TAPER_DEADLINE"].split(",")]
+            if len(parts) != 2:
+                raise ValueError(
+                    "DYN_TAPER_DEADLINE needs two numbers ttft_ms,per_token_ms"
+                )
+            c.deadline = tuple(parts)
+        c.slack_margin = float(env.get("DYN_TAPER_SLACK_MARGIN", c.slack_margin))
         c.trace_path = env.get("DYN_TAPER_TRACE", "")
         c.log_s = float(env.get("DYN_TAPER_LOG_S", c.log_s))
         return c
@@ -429,8 +446,14 @@ class TaperPolicy:
 # ---------------------------------------------------------------------------
 
 
-def cand_from_request(req: Any) -> Optional[Cand]:
-    """A ``Cand`` for a running vLLM request in the decode phase, else None."""
+def cand_from_request(
+    req: Any, cfg: Optional[TaperConfig] = None, now: Optional[float] = None
+) -> Optional[Cand]:
+    """A ``Cand`` for a running vLLM request in the decode phase, else None.
+
+    With ``cfg.deadline`` set, an interactive request also gets ``tau_ms``: the
+    per-token time it can still afford against its end-to-end deadline, taken
+    at ``max_tokens`` (``now``: wall-clock seconds, as ``req.arrival_time``)."""
     if (
         getattr(req, "is_prefill_chunk", False)
         or req.num_computed_tokens < req.num_prompt_tokens
@@ -451,6 +474,16 @@ def cand_from_request(req: Any) -> Optional[Cand]:
             str(ident.get("task") or req.request_id),
             str(ident.get("role", "")),
         )
+    elif cfg is not None and cfg.deadline is not None:
+        max_tokens = getattr(sp, "max_tokens", None) if sp is not None else None
+        arrival = getattr(req, "arrival_time", None)
+        if max_tokens and arrival is not None:
+            ttft_ms, per_token_ms = cfg.deadline
+            n = max(int(max_tokens), req.num_output_tokens + 1)
+            due_ms = arrival * 1e3 + ttft_ms + per_token_ms * n
+            now_ms = (time.time() if now is None else now) * 1e3
+            left = n - req.num_output_tokens
+            c.tau_ms = cfg.slack_margin * (due_ms - now_ms) / left
     return c
 
 
@@ -493,7 +526,8 @@ class TaperSkipMixin:
         self._taper_next_log = time.monotonic() + self._taper_cfg.log_s
         if self._taper_cfg.enabled:
             logger.info(
-                "taper.engine mode=%s coeffs=%s tau=%.2f/%.2f ms rho=%.2f K=%d guard=%d",
+                "taper.engine mode=%s coeffs=%s tau=%.2f/%.2f ms rho=%.2f K=%d guard=%d "
+                "deadline=%s margin=%.2f",
                 self._taper_cfg.mode,
                 self._taper_cfg.coeffs,
                 self._taper_cfg.tau_interactive_ms,
@@ -501,6 +535,8 @@ class TaperSkipMixin:
                 self._taper_cfg.rho,
                 self._taper_cfg.k,
                 self._taper_cfg.max_opp_ctx,
+                self._taper_cfg.deadline,
+                self._taper_cfg.slack_margin,
             )
 
     def _taper_apply(self) -> Optional[Decision]:
@@ -509,8 +545,9 @@ class TaperSkipMixin:
         t_start = time.perf_counter()
         by_id = {}
         cands = []
+        now = time.time()
         for req in self.running:
-            c = cand_from_request(req)
+            c = cand_from_request(req, self._taper_cfg, now)
             if c is not None:
                 cands.append(c)
                 by_id[c.req_id] = req

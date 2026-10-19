@@ -16,6 +16,7 @@ from dynamo.vllm.taper_engine import (
     TaperPolicy,
     TaperSkipMixin,
     attach_identity,
+    cand_from_request,
     identity_from_request,
 )
 
@@ -207,6 +208,29 @@ def test_residual_target_sets_the_step_budget():
     assert d_loose.tau_ms == 2 * p.cfg.tau_interactive_ms
     assert len(d_loose.skip) < len(fixed.skip) < len(d_tight.skip)
     assert d_tight.n_opp == 0
+
+
+def test_deadline_target_from_arrival_and_max_tokens():
+    c = TaperConfig(mode="class_blind", deadline=(500.0, 18.48), slack_margin=1.0)
+    r = FakeRequest("chat", 20_000, decoded=4)
+    r.arrival_time = 100.0
+    r.sampling_params.max_tokens = 64
+    # 200 ms in: (500 + 18.48 * 64 - 200) ms left for 60 tokens
+    got = cand_from_request(r, c, now=100.2).tau_ms
+    assert abs(got - (500 + 18.48 * 64 - 200) / 60) < 1e-6
+    agent = FakeRequest("a", 20_000, ident={"interactive": False, "task": "t"})
+    agent.arrival_time, agent.sampling_params.max_tokens = 100.0, 64
+    assert cand_from_request(agent, c, now=100.2).tau_ms is None
+    plain = TaperConfig(mode="class_blind")
+    assert cand_from_request(r, plain, now=100.2).tau_ms is None
+
+
+def test_config_deadline_from_env():
+    c = TaperConfig.from_env(
+        {"DYN_TAPER_DEADLINE": "500,18.48", "DYN_TAPER_SLACK_MARGIN": "0.8"}
+    )
+    assert c.deadline == (500.0, 18.48) and c.slack_margin == 0.8
+    assert TaperConfig.from_env({}).deadline is None
 
 
 def test_role_aware_never_skips_main_session():
