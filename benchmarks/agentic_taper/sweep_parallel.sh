@@ -77,6 +77,11 @@ PRED_COEFFS="${PRED_COEFFS:-}"
 VICTIM_PRIORITY="${VICTIM_PRIORITY:-}"
 PRIORITY_MIN="${PRIORITY_MIN:-1}"
 MOUNT_VLLM="${MOUNT_VLLM:-0}"
+# EXTRA_ENV: space-separated KEY=VALUE pairs passed to every stack container
+# ({RUN_DIR} becomes the run's output directory in the container), e.g. the
+# decode-regulation PR's DYN_DECODE_REGULATION_* settings on an image built
+# from that branch.
+EXTRA_ENV="${EXTRA_ENV:-}"
 PORT_BASE="${PORT_BASE:-0}"
 # Engine step-time model for the cb arm (empty: TaperConfig defaults, fitted on
 # MiniMax-M2 TP4 H200): "a,b,c" decode and "q,p" prefill, in ms (p per token).
@@ -209,6 +214,7 @@ for s in "${!SPEC[@]}"; do
              esac ;;
     esac
     (( MOUNT_VLLM )) && extra+=(-v "$REPO/components/src/dynamo/vllm:$SITE_VLLM")
+    for kv in $EXTRA_ENV; do extra+=(-e "${kv//\{RUN_DIR\}//workspace/$OUT_REL/$run}"); done
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
     for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=${GPU_LIST[$g]}"); done
@@ -288,6 +294,11 @@ for s in "${!SPEC[@]}"; do
         log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
         gate=" engine: $(grep -o 'taper.engine steps=.*' <<<"$log" | tail -1 || true)"
         grep -q 'taper.engine disabled' <<<"$log" && gate+=" [DISABLED: $(grep -m1 -o 'taper.engine disabled.*' <<<"$log")]"
+    fi
+    if grep -q 'decode_regulation' "$OUT/$run/stack.log" 2>/dev/null; then
+        log=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/$run/stack.log")
+        gate+=" regulation: $(grep -o 'decode_regulation steps=.*' <<<"$log" | tail -1 || true)"
+        grep -q 'decode_regulation disabled' <<<"$log" && gate+=" [DISABLED: $(grep -m1 -o 'decode_regulation disabled.*' <<<"$log")]"
     fi
     echo "slot $s: $run finished ($(date -u +%H:%M:%S))$gate"
 done
