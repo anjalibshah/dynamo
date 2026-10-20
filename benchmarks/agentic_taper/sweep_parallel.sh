@@ -218,7 +218,10 @@ for s in "${!SPEC[@]}"; do
     # This slot's GPUs as CDI devices; inside the container they are 0..G-1.
     dev=()
     for (( g = s * GPUS_PER_SLOT; g < (s + 1) * GPUS_PER_SLOT; g++ )); do dev+=(--device "nvidia.com/gpu=${GPU_LIST[$g]}"); done
-    CID[$s]=$(podman run -d --rm --init --network host "${dev[@]}" --shm-size "$SHM_SIZE" \
+    # Images built from newer main run as a non-root user that cannot write /tmp or
+    # the mounted scratch dirs; CONTAINER_USER=0 runs as root (your own uid under rootless podman).
+    user=(); [[ -n "${CONTAINER_USER:-}" ]] && user=(--user "$CONTAINER_USER")
+    CID[$s]=$(podman run -d --rm --init --network host ${user[@]+"${user[@]}"} "${dev[@]}" --shm-size "$SHM_SIZE" \
         -v "$REPO:/workspace" -v "$REPO/components/src/dynamo/taper_router:$SITE" \
         -v "$HF:$HF" -e "HF_HOME=$HF" -e NO_COLOR=1 \
         -e "MODEL_PATH=$MODEL_PATH" -e "MODEL_NAME_ROUTER=$MODEL" -e "GPUS=$IN_GPUS" -e "TP=$GPUS_PER_SLOT" \
