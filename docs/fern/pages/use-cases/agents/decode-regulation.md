@@ -85,6 +85,27 @@ Setting `DYN_DECODE_REGULATION_MODE` selects Dynamo's `DecodeRegulationScheduler
 
 Choose the deadline from the unloaded latency of the model on your hardware. A per-token budget of about 3× the unloaded inter-token latency leaves regulated requests room to decode; a budget close to the unloaded latency forces regulation on almost every step.
 
+### With the vLLM Sidecar
+
+The vLLM sidecar (`lib/sidecar/vllm`) runs a stock vLLM engine, so the Dynamo worker cannot select the scheduler for you. Set the same variables on the engine, and select the scheduler with `--scheduler-cls`:
+
+```bash
+export DYN_DECODE_REGULATION_MODE=class_blind
+export DYN_DECODE_REGULATION_PRIORITY_MIN=1
+export DYN_DECODE_REGULATION_DEADLINE=500,18.48
+export DYN_DECODE_REGULATION_COEFFS=6.4013,0.227066,0.000016055   # fit for your deployment
+export DYN_DECODE_REGULATION_METRICS_PORT=9400
+lib/sidecar/vllm/launch/agg.sh --model MiniMaxAI/MiniMax-M2.7 --tensor-parallel-size 4 \
+    --scheduler-cls dynamo.vllm.decode_regulation_sidecar.SidecarDecodeRegulationScheduler
+```
+
+The engine needs only three files from Dynamo: `dynamo/vllm/__init__.py`, `decode_regulation.py` and `decode_regulation_sidecar.py`. In an environment with Dynamo installed they are already importable. On Kubernetes, `lib/sidecar/vllm/deploy/agg_decode_regulation.yaml` mounts them from a ConfigMap into the stock vLLM image.
+
+Two things differ from the in-process worker:
+
+- `DYN_DECODE_REGULATION_PRIORITY_MIN` is required. The sidecar forwards Dynamo's priority to vLLM but not the agent session ID, so requests are classified by priority only.
+- The metrics are served by the engine on `DYN_DECODE_REGULATION_METRICS_PORT` plus the data-parallel rank, not on the sidecar's `/metrics`, and carry no Dynamo hierarchy labels.
+
 ## Calibrate the Step-Time Model
 
 The coefficients above were fitted for MiniMax-M2.7 with tensor parallelism 4 and an FP8 KV cache on H200. Fit your own for any other model, GPU or parallelism:
@@ -127,6 +148,7 @@ Set these on the vLLM worker.
 | `DYN_DECODE_REGULATION_FAILSAFE_STEPS` | `200` | Decode-only steps with the bias at its limit before regulation turns off. `0` disables the guard. |
 | `DYN_DECODE_REGULATION_TRACE` | unset | Path for a per-step JSONL trace. |
 | `DYN_DECODE_REGULATION_LOG_S` | `10` | Seconds between summary log lines. |
+| `DYN_DECODE_REGULATION_METRICS_PORT` | unset | Sidecar only: the engine serves the metrics on this port plus the data-parallel rank. |
 
 Regulation turns itself off, with a warning, when the worker uses pipeline parallelism or speculative decoding, or when the installed vLLM no longer has the scheduler internals it relies on. The worker then serves with stock vLLM scheduling.
 

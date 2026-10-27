@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# EXPERIMENTAL: agg.yaml with decode regulation in the stock vLLM engine.
+#
+# The engine loads Dynamo's scheduler from three Python files mounted from a
+# ConfigMap, so the vLLM image stays stock. Create the ConfigMap first, from
+# the repository root:
+#
+#   kubectl create configmap dynamo-decode-regulation -n <namespace> \
+#     --from-file=components/src/dynamo/vllm/__init__.py \
+#     --from-file=components/src/dynamo/vllm/decode_regulation.py \
+#     --from-file=components/src/dynamo/vllm/decode_regulation_sidecar.py
+#
+# Fit DYN_DECODE_REGULATION_COEFFS for your model and GPUs; see
+# docs/fern/pages/use-cases/agents/decode-regulation.md.
+
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-sidecar-agg-decode-regulation
+spec:
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+        - name: main
+          image: <your-registry>/dynamo-frontend:1.6.0
+  - name: worker
+    type: worker
+    replicas: 1
+    podTemplate:
+      spec:
+        initContainers:
+        - name: runtime
+          image: <your-registry>/dynamo-sidecar:1.6.0
+          command:
+          - dynamo-vllm-sidecar
+          args:
+          - --grpc-endpoint
+          - 127.0.0.1:30001
+          restartPolicy: Always
+        containers:
+        - name: main
+          image: vllm/vllm-openai:v0.28.0
+          env:
+          - name: PYTHONPATH
+            value: /opt/dynamo-decode-regulation
+          - name: DYN_DECODE_REGULATION_MODE
+            value: class_blind
+          - name: DYN_DECODE_REGULATION_PRIORITY_MIN
+            value: "1"
+          - name: DYN_DECODE_REGULATION_DEADLINE
+            value: "500,18.48"
+          - name: DYN_DECODE_REGULATION_COEFFS
+            value: "6.4013,0.227066,0.000016055"
+          - name: DYN_DECODE_REGULATION_METRICS_PORT
+            value: "9400"
+          ports:
+          - name: regulation
+            containerPort: 9400
+          volumeMounts:
+          - name: decode-regulation
+            mountPath: /opt/dynamo-decode-regulation/dynamo/vllm
+            readOnly: true
+          startupProbe:
+            grpc:
+              port: 30001
+              service: ""
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          readinessProbe:
+            grpc:
+              port: 30001
+              service: ""
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 30001
+              service: ""
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            limits:
+              nvidia.com/gpu: '1'
+            requests:
+              ephemeral-storage: 2Gi
+          command:
+          - /bin/sh
+          - -c
+          - exec "$(python3 -c 'import os,vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+            serve Qwen/Qwen3-0.6B --host 0.0.0.0 --grpc-port 30001
+            --reasoning-parser none
+            --
+            --scheduler-cls dynamo.vllm.decode_regulation_sidecar.SidecarDecodeRegulationScheduler
+        volumes:
+        - name: decode-regulation
+          configMap:
+            name: dynamo-decode-regulation
+  backendFramework: vllm
