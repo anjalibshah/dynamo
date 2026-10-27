@@ -364,8 +364,15 @@ def _static_from_request(req: Any, cfg: Optional[DecodeRegulationConfig]) -> _St
     sp = getattr(req, "sampling_params", None)
     extra = getattr(sp, "extra_args", None) if sp is not None else None
     ident = extra.get(EXTRA_ARGS_KEY) if isinstance(extra, dict) else None
-    if isinstance(ident, dict) and not ident.get("interactive", True):
-        return _Static(interactive=False)
+    if isinstance(ident, dict):
+        if not ident.get("interactive", True):
+            return _Static(interactive=False)
+    elif cfg is not None and cfg.priority_min is not None:
+        # No class from Dynamo's in-process handler (the sidecar backend): the
+        # sidecar forwards Dynamo's priority as vLLM's, negated (lower runs earlier).
+        prio = getattr(req, "priority", None)
+        if isinstance(prio, int) and -prio < cfg.priority_min:
+            return _Static(interactive=False)
     st = _Static()
     if cfg is not None and cfg.deadline is not None:
         max_tokens = getattr(sp, "max_tokens", None) if sp is not None else None
@@ -503,6 +510,41 @@ class DecodeRegulationMixin:
                 self._reg_cfg.deadline,
                 self._reg_cfg.slack_margin,
             )
+
+    def _reg_init_vllm(
+        self,
+        vllm_config: Any,
+        scheduler_cls: Any,
+        request_cls: Any,
+        metrics_registry: Any = None,
+    ) -> None:
+        """``_reg_init`` for a vLLM scheduler: turns regulation off where the skip
+        is unsupported. Call after the scheduler's own ``__init__``."""
+        unsupported = []
+        skip_unsupported = vllm_skip_unsupported(scheduler_cls, request_cls)
+        if skip_unsupported:
+            unsupported.append(skip_unsupported)
+        if getattr(self, "use_pp", False):
+            unsupported.append(
+                "pipeline parallelism (placeholders may be non-zero on rejoin)"
+            )
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            unsupported.append(
+                "speculative decoding (skipped requests keep draft placeholders)"
+            )
+        model = getattr(
+            getattr(vllm_config, "model_config", None), "served_model_name", ""
+        )
+        dp_rank = getattr(
+            getattr(vllm_config, "parallel_config", None), "data_parallel_rank", 0
+        )
+        self._reg_init(
+            DecodeRegulationConfig.from_env(),
+            unsupported="; ".join(unsupported),
+            model_name=model if isinstance(model, str) else str(model),
+            dp_rank=dp_rank or 0,
+            metrics_registry=metrics_registry,
+        )
 
     def _reg_apply(self) -> Optional[Decision]:
         if not self._reg_cfg.enabled or getattr(self, "_bench_active", False):

@@ -15,45 +15,14 @@ Selected automatically when ``DYN_DECODE_REGULATION_MODE`` is not ``off``
 
 from __future__ import annotations
 
-import logging
-
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
-from dynamo.vllm.decode_regulation import (
-    DecodeRegulationConfig,
-    DecodeRegulationMixin,
-    vllm_skip_unsupported,
-)
+from dynamo.vllm.decode_regulation import DecodeRegulationMixin
 from dynamo.vllm.instrumented_scheduler import InstrumentedScheduler
-
-logger = logging.getLogger(__name__)
 
 
 class DecodeRegulationScheduler(DecodeRegulationMixin, InstrumentedScheduler):
     def __init__(self, vllm_config, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
-        unsupported = []
-        skip_unsupported = vllm_skip_unsupported(Scheduler, Request)
-        if skip_unsupported:
-            unsupported.append(skip_unsupported)
-        if getattr(self, "use_pp", False):
-            unsupported.append(
-                "pipeline parallelism (placeholders may be non-zero on rejoin)"
-            )
-        if getattr(vllm_config, "speculative_config", None) is not None:
-            unsupported.append(
-                "speculative decoding (skipped requests keep draft placeholders)"
-            )
-        model = getattr(
-            getattr(vllm_config, "model_config", None), "served_model_name", ""
-        )
-        dp_rank = getattr(
-            getattr(vllm_config, "parallel_config", None), "data_parallel_rank", 0
-        )
-        self._reg_init(
-            DecodeRegulationConfig.from_env(),
-            unsupported="; ".join(unsupported),
-            model_name=model if isinstance(model, str) else str(model),
-            dp_rank=dp_rank or 0,
-        )
+        self._reg_init_vllm(vllm_config, Scheduler, Request)

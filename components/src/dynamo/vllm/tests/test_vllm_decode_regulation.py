@@ -300,6 +300,28 @@ def test_priority_mode_regulates_plain_low_priority_requests():
     assert len(scheduled) < len(reqs)
 
 
+def test_native_priority_classifies_requests_without_identity():
+    """The sidecar attaches no class; it sets vLLM's priority to Dynamo's, negated."""
+    reqs = [FakeRequest("chat", 20_000)]
+    reqs += [FakeRequest(f"b{i}", 100_000) for i in range(10)]
+    reqs[0].priority = -1  # Dynamo priority 1
+    for r in reqs[1:]:
+        r.priority = 0
+    s = Sched(reqs, cfg("class_blind", priority_min=1))
+    scheduled = step(s)
+    assert "chat" in scheduled
+    assert len(scheduled) < len(reqs)
+
+
+@pytest.mark.parametrize("ident", [None, {"interactive": True}])
+def test_native_priority_needs_priority_min_and_no_identity(ident):
+    r = FakeRequest("x", 100_000, ident)
+    r.priority = 0
+    assert cand_from_request(r, cfg()).interactive
+    if ident is not None:
+        assert cand_from_request(r, cfg(priority_min=1)).interactive
+
+
 def test_summary_counts_both_classes():
     reqs = overloaded(n_subs=2, ctx=10_000)
     s = Sched(reqs, cfg("class_blind", priority_min=1))
@@ -572,3 +594,30 @@ def test_installed_vllm_supports_the_skip():
     assert out.returncode == 0, out.stderr[-2000:]
     result = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT=")]
     assert result == ["RESULT="], out.stdout[-2000:]
+
+
+_SIDECAR_IMPORT = """
+import sys
+from vllm.v1.core.sched.scheduler import Scheduler
+from dynamo.vllm.decode_regulation_sidecar import SidecarDecodeRegulationScheduler
+assert issubclass(SidecarDecodeRegulationScheduler, Scheduler)
+light = {"dynamo.vllm", "dynamo.vllm._version", "dynamo.vllm.decode_regulation",
+         "dynamo.vllm.decode_regulation_sidecar"}
+print("EXTRA=" + ",".join(sorted(
+    n for n in sys.modules if n.startswith("dynamo.") and n not in light)))
+"""
+
+
+def test_sidecar_scheduler_needs_only_decode_regulation():
+    """A stock vLLM engine under the sidecar has no Dynamo installed: the sidecar
+    scheduler may import only the three files shipped to it."""
+    pytest.importorskip("vllm.v1.core.sched.scheduler")
+    out = subprocess.run(
+        [sys.executable, "-c", _SIDECAR_IMPORT],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    result = [ln for ln in out.stdout.splitlines() if ln.startswith("EXTRA=")]
+    assert result == ["EXTRA="], out.stdout[-2000:]
