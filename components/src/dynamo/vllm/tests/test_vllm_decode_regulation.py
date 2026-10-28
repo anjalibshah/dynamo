@@ -598,9 +598,9 @@ def test_installed_vllm_supports_the_skip():
 
 _SIDECAR_IMPORT = """
 import sys
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from dynamo.vllm.decode_regulation_sidecar import SidecarDecodeRegulationScheduler
-assert issubclass(SidecarDecodeRegulationScheduler, Scheduler)
+assert issubclass(SidecarDecodeRegulationScheduler, AsyncScheduler)  # keeps async scheduling
 light = {"dynamo.vllm", "dynamo.vllm._version", "dynamo.vllm.decode_regulation",
          "dynamo.vllm.decode_regulation_sidecar"}
 print("EXTRA=" + ",".join(sorted(

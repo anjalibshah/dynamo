@@ -94,7 +94,7 @@ export DYN_DECODE_REGULATION_MODE=class_blind
 export DYN_DECODE_REGULATION_PRIORITY_MIN=1
 export DYN_DECODE_REGULATION_DEADLINE=500,18.48
 export DYN_DECODE_REGULATION_COEFFS=6.4013,0.227066,0.000016055   # fit for your deployment
-export DYN_DECODE_REGULATION_METRICS_PORT=9400
+export DYN_DECODE_REGULATION_METRICS_PORT=9095
 lib/sidecar/vllm/launch/agg.sh --model MiniMaxAI/MiniMax-M2.7 --tensor-parallel-size 4 \
     --scheduler-cls dynamo.vllm.decode_regulation_sidecar.SidecarDecodeRegulationScheduler
 ```

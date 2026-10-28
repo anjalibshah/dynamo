@@ -58,10 +58,10 @@ spec:
           - name: DYN_DECODE_REGULATION_COEFFS
             value: "6.4013,0.227066,0.000016055"
           - name: DYN_DECODE_REGULATION_METRICS_PORT
-            value: "9400"
+            value: "9095"
           ports:
           - name: regulation
-            containerPort: 9400
+            containerPort: 9095
           volumeMounts:
           - name: decode-regulation
             mountPath: /opt/dynamo-decode-regulation/dynamo/vllm
