@@ -12,7 +12,8 @@
 #
 # Required env: IMAGE (built from feat/sidecar-decode-regulation-eval), HF, OUT_ROOT, PY
 # (a Python with aiohttp). Optional: MODEL, GPU (CDI index), COEFFS, DEADLINE,
-# DURATION_S, BG_CONC, BG_PROMPT_TOKENS, BG_MAX_TOKENS, MAX_MODEL_LEN, CONTAINER_USER.
+# DURATION_S, BG_CONC, BG_PROMPT_TOKENS, BG_MAX_TOKENS, MAX_MODEL_LEN, METRICS_PORT,
+# CONTAINER_USER.
 set -euo pipefail
 
 ARM="${1:?usage: sidecar_smoke.sh off|observe|class_blind}"
@@ -26,6 +27,7 @@ BG_CONC="${BG_CONC:-48}"
 BG_PROMPT_TOKENS="${BG_PROMPT_TOKENS:-12000}"
 BG_MAX_TOKENS="${BG_MAX_TOKENS:-1500}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
+METRICS_PORT="${METRICS_PORT:-9095}"  # 9400 is the DCGM exporter default
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$OUT_ROOT/$ARM"
 mkdir -p "$OUT" && chmod 777 "$OUT"
@@ -35,7 +37,7 @@ sched_args=""
 if [[ "$ARM" != off ]]; then
     env_args+=(-e "DYN_DECODE_REGULATION_MODE=$ARM" -e DYN_DECODE_REGULATION_PRIORITY_MIN=1
                -e "DYN_DECODE_REGULATION_DEADLINE=$DEADLINE"
-               -e DYN_DECODE_REGULATION_METRICS_PORT=9400
+               -e "DYN_DECODE_REGULATION_METRICS_PORT=$METRICS_PORT"
                -e DYN_DECODE_REGULATION_TRACE=/out/trace.jsonl)
     [[ -n "$COEFFS" ]] && env_args+=(-e "DYN_DECODE_REGULATION_COEFFS=$COEFFS")
     sched_args="--scheduler-cls dynamo.vllm.decode_regulation_sidecar.SidecarDecodeRegulationScheduler"
@@ -85,6 +87,6 @@ sleep 60  # let the background batch fill before probing
 "$PY" "$HERE/victim_client.py" --base-url http://127.0.0.1:8000 --model "$SERVED" \
     --arm "$ARM" --out "$OUT/victims.jsonl" --n-victims $(( (DURATION_S - 90) / 2 )) \
     --mean-arrival-ms 2000 --seed 0 --priority 1 > "$OUT/victim_client.log" 2>&1
-[[ "$ARM" != off ]] && curl -sf localhost:9400/metrics > "$OUT/metrics.txt" || true
+[[ "$ARM" != off ]] && curl -sf "localhost:$METRICS_PORT/metrics" > "$OUT/metrics.txt" || true
 wait "$BG" || true
 echo "$ARM: done"
